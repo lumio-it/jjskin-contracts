@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "forge-std/Script.sol";
+import {VerifierNetwork} from "../src/VerifierNetwork.sol";
+import {VerifierNetworkExt} from "../src/VerifierNetworkExt.sol";
+import {MockUSDC} from "../src/mocks/MockUSDC.sol";
+
+/**
+ * @title DeployVerifierNetwork
+ * @notice Deployment script for VerifierNetwork on Arbitrum Sepolia
+ *
+ * Chainlink VRF V2.5 on Arbitrum Sepolia:
+ * - Coordinator: 0x5CE8D5A2BC84beb22a398CCA51996F7930313D61
+ * - Key Hash (50 gwei): 0x1770bdc7eec7771f7ba4ffd640f34260d7f095b79c92d34a5b2551d6f6cfd2be
+ * - LINK Token: 0xb1D4538B4571d411F07960EF2838Ce337FE1E80E
+ *
+ * Usage:
+ *   # With .env file
+ *   forge script script/DeployVerifierNetwork.s.sol:DeployVerifierNetwork \
+ *     --rpc-url arbitrum-sepolia \
+ *     --broadcast \
+ *     --verify
+ *
+ *   # For shadow mode (no broadcast)
+ *   forge script script/DeployVerifierNetwork.s.sol:DeployVerifierNetwork \
+ *     --rpc-url arbitrum-sepolia
+ */
+contract DeployVerifierNetwork is Script {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Arbitrum Sepolia Constants
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    address constant VRF_COORDINATOR = 0x5CE8D5A2BC84beb22a398CCA51996F7930313D61;
+    bytes32 constant VRF_KEY_HASH = 0x1770bdc7eec7771f7ba4ffd640f34260d7f095b79c92d34a5b2551d6f6cfd2be;
+
+    // Testnet USDC - use mock for now
+    // For actual Circle USDC on Arbitrum Sepolia, check Circle's bridge
+    address constant MOCK_USDC = address(0); // Will deploy if 0
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deployment State
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    struct DeploymentResult {
+        address verifierNetwork;
+        address usdc;
+        uint64 vrfSubscriptionId;
+    }
+
+    function run() external returns (DeploymentResult memory result) {
+        // Load private key from environment
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address deployer = vm.addr(deployerKey);
+
+        console.log("=== VerifierNetwork Deployment ===");
+        console.log("Deployer:", deployer);
+        console.log("Chain ID:", block.chainid);
+        console.log("VRF Coordinator:", VRF_COORDINATOR);
+
+        vm.startBroadcast(deployerKey);
+
+        // Step 1: Deploy or use existing USDC
+        address usdcAddress = _deployOrGetUSDC();
+        result.usdc = usdcAddress;
+        console.log("USDC Address:", usdcAddress);
+
+        // Step 2: Get JJSKIN address from env (or use placeholder for shadow mode)
+        address jjskinAddress = _getJJSKINAddress();
+        console.log("JJSKIN Address:", jjskinAddress);
+
+        // Step 3a: Deploy VerifierNetworkExt first (CometExt pattern)
+        VerifierNetworkExt extension = new VerifierNetworkExt(usdcAddress, jjskinAddress);
+        console.log("VerifierNetworkExt deployed:", address(extension));
+
+        // Step 3b: Deploy VerifierNetwork with extension
+        VerifierNetwork network = new VerifierNetwork(
+            usdcAddress,
+            jjskinAddress,
+            VRF_COORDINATOR,
+            address(extension)
+        );
+        result.verifierNetwork = address(network);
+        console.log("VerifierNetwork deployed:", address(network));
+
+        // Step 4: Configure VRF (subscription ID should be created beforehand)
+        // Note: setVRFConfig is in Extension, called via Main's fallback delegatecall
+        uint64 subscriptionId = uint64(vm.envOr("VRF_SUBSCRIPTION_ID", uint256(0)));
+        if (subscriptionId > 0) {
+            // Cast to Extension interface for functions in Extension (delegatecall via fallback)
+            VerifierNetworkExt(address(network)).setVRFConfig(subscriptionId, VRF_KEY_HASH);
+            result.vrfSubscriptionId = subscriptionId;
+            console.log("VRF Configured with subscription:", subscriptionId);
+        } else {
+            console.log("WARNING: VRF subscription not configured. Set VRF_SUBSCRIPTION_ID env var.");
+        }
+
+        vm.stopBroadcast();
+
+        // Print summary
+        _printSummary(result, jjskinAddress);
+
+        return result;
+    }
+
+    function _deployOrGetUSDC() internal returns (address) {
+        // Check if USDC address is provided in env
+        address existingUSDC = vm.envOr("USDC_ADDRESS", address(0));
+        if (existingUSDC != address(0)) {
+            console.log("Using existing USDC:", existingUSDC);
+            return existingUSDC;
+        }
+
+        // Deploy MockUSDC for testnet
+        console.log("Deploying MockUSDC...");
+        MockUSDC mockUsdc = new MockUSDC();
+        return address(mockUsdc);
+    }
+
+    function _getJJSKINAddress() internal view returns (address) {
+        // For shadow mode testing, we can use a mock or placeholder
+        address jjskin = vm.envOr("JJSKIN_ADDRESS", address(0));
+        if (jjskin == address(0)) {
+            console.log("WARNING: JJSKIN_ADDRESS not set. Using placeholder.");
+            // In production, this would revert
+            // For testnet shadow mode, we use a placeholder
+            return address(0xDEAD);
+        }
+        return jjskin;
+    }
+
+    function _printSummary(DeploymentResult memory result, address jjskin) internal pure {
+        console.log("");
+        console.log("=== Deployment Summary ===");
+        console.log("VerifierNetwork:", result.verifierNetwork);
+        console.log("USDC:", result.usdc);
+        console.log("JJSKIN:", jjskin);
+        console.log("VRF Subscription:", result.vrfSubscriptionId);
+        console.log("");
+        console.log("=== Next Steps ===");
+        console.log("1. Create VRF subscription at https://vrf.chain.link/arbitrum-sepolia");
+        console.log("2. Add VerifierNetwork as consumer to subscription");
+        console.log("3. Fund subscription with LINK");
+        console.log("4. Call setVRFConfig(subscriptionId, keyHash) if not already done");
+        console.log("5. Register verifiers with registerVerifier()");
+        console.log("6. Call startNewEpoch() to initialize VRF");
+        console.log("7. Update JJSKIN.setOracle(verifierNetworkAddress)");
+    }
+}
+
+/**
+ * @title DeployShadowMode
+ * @notice Deploy VerifierNetwork in shadow mode (parallel to existing oracle)
+ *
+ * In shadow mode:
+ * - VerifierNetwork is deployed but NOT set as oracle on JJSKIN
+ * - Batches can be created and voted on
+ * - Execution is simulated (doesn't call JJSKIN)
+ * - Used to validate verifier behavior before full migration
+ */
+contract DeployShadowMode is Script {
+    address constant VRF_COORDINATOR = 0x5CE8D5A2BC84beb22a398CCA51996F7930313D61;
+    bytes32 constant VRF_KEY_HASH = 0x1770bdc7eec7771f7ba4ffd640f34260d7f095b79c92d34a5b2551d6f6cfd2be;
+
+    function run() external {
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+
+        console.log("=== Shadow Mode Deployment ===");
+        console.log("This deployment will NOT be connected to JJSKIN");
+
+        vm.startBroadcast(deployerKey);
+
+        // Deploy MockUSDC for shadow testing
+        MockUSDC mockUsdc = new MockUSDC();
+        console.log("MockUSDC deployed:", address(mockUsdc));
+
+        // Deploy extension first (CometExt pattern)
+        // Using address(1) as placeholder JJSKIN for shadow mode
+        VerifierNetworkExt extension = new VerifierNetworkExt(address(mockUsdc), address(1));
+        console.log("VerifierNetworkExt deployed:", address(extension));
+
+        // Deploy with placeholder JJSKIN (shadow mode - won't call it)
+        // Using address(1) as a non-zero placeholder
+        VerifierNetwork network = new VerifierNetwork(
+            address(mockUsdc),
+            address(1), // Shadow mode - won't actually call JJSKIN
+            VRF_COORDINATOR,
+            address(extension)
+        );
+        console.log("VerifierNetwork (Shadow Mode):", address(network));
+
+        vm.stopBroadcast();
+
+        console.log("");
+        console.log("=== Shadow Mode Ready ===");
+        console.log("1. Create VRF subscription and add this contract");
+        console.log("2. Register test verifiers");
+        console.log("3. Create batches matching production trades");
+        console.log("4. Compare voting outcomes with production oracle");
+    }
+}

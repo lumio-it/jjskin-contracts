@@ -1,0 +1,21 @@
+## tlsn-server config for local Anvil E2E testing
+## Usage:
+##   docker run -p 7047:7047 \
+##     -v $(pwd)/script/local-oracle.yaml:/app/config.yaml \
+##     -e ORACLE_SIGNING_KEY=<hex_key_without_0x> \
+##     tlsn-server --config /app/config.yaml
+
+host: "0.0.0.0"
+port: 7047
+
+notarization:
+  max_sent_data: 4096
+  max_recv_data: 16384
+  timeout: 120
+
+oracle:
+  ## Set via ORACLE_SIGNING_KEY env var (takes priority over signing_key_path)
+  rpc_url: "http://host.docker.internal:8545"
+  contract_address: "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+  steam_factory_address: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+  chain_id: 31337

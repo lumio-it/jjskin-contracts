@@ -1,0 +1,2204 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+// BLS removed - msg.sender proves identity in commit-reveal
+import {CryptoeconomicSecurity} from "../libraries/CryptoeconomicSecurity.sol";
+import {IJJSKIN} from "../interfaces/IJJSKIN.sol";
+
+/**
+ * @title VerifierNetwork
+ * @author JJSKIN / Lumio
+ * @notice Production-grade decentralized verifier network for JJSKIN marketplace
+ * @dev Implements BFT consensus with:
+ *      - Chainlink VRF v2.5 for random verifier selection
+ *      - Commit-reveal voting (msg.sender proves identity)
+ *      - 28-day unbonding period (Chainlink v0.2 pattern)
+ *      - Non-blocking ground truth audits (UMA pattern)
+ *      - Slashing treasury with DAO allocation (Pyth pattern)
+ *
+ * Architecture:
+ * - Fully permissionless from day 1
+ * - VRF-based verifier selection per batch
+ * - Commit-reveal voting (msg.sender = identity)
+ * - Retry mechanism for non-responsive verifiers
+ *
+ * Trust Model:
+ * - Verifiers stake USDC as collateral
+ * - Dynamic threshold: T = ceil((2n+1)/3) for BFT
+ * - Minority voters get slashed over time
+ * - Batch cap = totalStake * (threshold/total)
+ *
+ * Key Design Principle:
+ * - Seller funds NEVER blocked by audits
+ * - Consensus reached -> funds released immediately -> audit async
+ * - If audit finds error -> slash verifiers post-facto
+ *
+ * Immutability:
+ * - This contract is NOT upgradeable by design
+ * - If bugs found: deploy new contract, call JJSKIN.setOracle(newAddress)
+ * - Funds are held by JJSKIN, not this contract (only stakes here)
+ *
+ * References:
+ * - Chainlink VRF v2.5: https://docs.chain.link/vrf/v2-5/getting-started
+ * - Chainlink Staking v0.2: https://blog.chain.link/chainlink-staking-v0-2-overview/
+ * - UMA Optimistic Oracle: https://docs.uma.xyz/protocol-overview/how-does-umas-oracle-work
+ * - Pyth OIS: https://docs.pyth.network/home/oracle-integrity-staking
+ */
+contract VerifierNetwork is ReentrancyGuard, VRFConsumerBaseV2Plus {
+    using SafeERC20 for IERC20;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TYPES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Verifier decision for a batch
+    enum Decision {
+        NONE,       // No decision yet
+        CLAIM,      // Release funds to seller
+        REFUND,     // Return funds to buyer
+        INVALID     // Proof was invalid, no action
+    }
+
+    /// @notice Refund reason - deterministic from proof analysis
+    /// @dev No "Other" - all refunds must have a specific, verifiable reason
+    enum RefundReason {
+        None,              // Not a refund (used for CLAIM/INVALID decisions)
+        FailedDelivery,    // Seller didn't send trade offer in time
+        TradeReversed,     // Seller reversed Steam trade (malicious)
+        TradeDeclined,     // Buyer declined trade offer
+        Expired            // Trade offer expired without completion
+    }
+
+    /// @notice Per-asset decision from a verifier
+    /// @dev Used in commit-reveal: commit = hash(AssetDecision[], salt)
+    struct AssetDecision {
+        uint64 assetId;
+        Decision decision;
+        RefundReason refundReason;  // Only relevant if decision == REFUND
+    }
+
+    /// @notice Batch state in commit-reveal protocol
+    enum BatchState {
+        NONE,           // Doesn't exist
+        COMMIT_PHASE,   // Accepting commitments
+        REVEAL_PHASE,   // Accepting reveals
+        READY,          // Ready for execution
+        EXECUTED        // Already executed
+    }
+
+    /// @notice Audit state for ground truth verification
+    enum AuditState {
+        NONE,       // Not selected for audit
+        PENDING,    // Selected, awaiting challenge window
+        VOTING,     // Audit batch created, voting in progress
+        RESOLVED    // Audit complete (audit batch executed)
+    }
+
+    /// @notice Verifier registration and state
+    struct Verifier {
+        uint256 stakedAmount;       // USDC staked (live, updated immediately)
+        uint256 selectionStake;     // Epoch-locked stake for selection (snapshot)
+        uint256 unbondingAmount;    // Amount currently unbonding
+        uint256 pendingRewards;     // Accumulated rewards
+        uint256 minorityVotes;      // Times voted with minority (per-asset)
+        uint256 totalVotes;         // Total asset-votes cast
+        uint256 assignedBatches;    // Total batches participated in
+        uint40 registeredAt;        // Registration timestamp
+        uint40 lastSlashTime;       // Last time slashed
+        uint40 unbondingStart;      // When unbonding started
+        uint8 minorityWarnings;     // Warning count for minority voting
+        uint8 participationWarnings; // Warning count for low participation
+        bool isActive;              // Currently active
+        // NOTE: stakeBucket removed - computed on-demand from selectionStake
+    }
+
+    /// @notice Batch for commit-reveal voting (per-asset consensus)
+    /// @dev Vote counts are tracked per-asset in separate mappings
+    ///      Audit/challenge batches reuse this struct with isAuditBatch=true
+    ///      Optimized packing: ~9 storage slots for normal batch
+    struct Batch {
+        // ─── Slot 0 (dynamic array pointer) ───
+        uint64[] assetIds;          // Assets in this batch
+        // ─── Slot 1 ─── (16+16 = 32 bytes, packed)
+        uint128 totalValue;         // Sum of trade values (USDC)
+        uint128 creatorDeposit;     // Deposit paid by creator
+        // ─── Slot 2 ─── (packed: 5+5+5+5+1+1+1+1 = 24 bytes)
+        uint40 commitDeadline;      // End of commit phase (current round)
+        uint40 revealDeadline;      // End of reveal phase (current round)
+        uint40 executedAt;          // When batch was executed
+        uint40 createdAt;           // When batch was created
+        BatchState state;           // Current state (1 byte)
+        uint8 revealCount;          // Reveals in current round
+        uint8 currentRound;         // Current retry round (0-indexed)
+        bool isAuditBatch;          // True if audit re-vote batch
+        // ─── Slot 3 ───
+        address creator;            // Who created the batch
+        uint64 arweaveBlock;        // Arweave block height
+        // ─── Slot 4 ───
+        address executor;           // Who triggered execution
+        // ─── Slot 5 ───
+        uint256 batchEpoch;         // Epoch when batch was created (for seed)
+    }
+
+    /// @notice Audit batch metadata (stored separately to reduce Batch struct size)
+    struct AuditBatchMeta {
+        bytes32 originalBatchId;    // The batch being audited
+        address challenger;         // Who challenged (address(0) for random audit)
+    }
+
+    /// @notice Consensus result for a single asset after voting
+    struct AssetConsensus {
+        Decision decision;          // Final consensus decision
+        RefundReason refundReason;  // Reason if decision is REFUND
+        uint8 votesFor;             // Votes for this decision
+        bool hasConsensus;          // True if threshold reached
+    }
+
+    /// @notice Ground truth audit tracking
+    /// @dev Simplified: audit logic now lives in audit batches (isAuditBatch=true)
+    struct Audit {
+        bytes32 auditBatchId;       // The audit batch that re-votes this batch
+        AuditState state;           // NONE, PENDING (selected), VOTING, RESOLVED
+        uint40 challengeDeadline;   // Deadline to challenge (for PENDING state)
+    }
+
+    /// @notice VRF epoch for verifier selection
+    struct Epoch {
+        uint256 vrfRequestId;       // Chainlink VRF request ID
+        uint256 randomSeed;         // Random seed from VRF
+        uint40 startTime;           // When epoch started
+        bool fulfilled;             // VRF callback received
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Minimum stake to register as verifier
+    uint256 public constant MIN_STAKE = 1000e6; // $1,000 USDC
+
+    /// @notice Minimum verifiers for BFT consensus
+    uint256 public constant MIN_ORACLE_COUNT = 4;
+
+    /// @notice Minimum verifiers before enforcing stake concentration limit
+    /// @dev Higher than MIN_ORACLE_COUNT to allow network bootstrap
+    ///      At 4 verifiers with MIN_STAKE, 5th verifier would exceed 10% cap
+    ///      Solution: delay concentration enforcement until sufficient decentralization
+    /// @custom:security Analyzed in CRYPTOECONOMIC_SECURITY.md
+    uint256 public constant CONCENTRATION_ENFORCEMENT_MIN = 10;
+
+    /// @notice Minimum committee size for any batch (BFT minimum)
+    uint256 public constant MIN_COMMITTEE_SIZE = 4;
+
+    /// @notice Maximum committee size (caps gas costs for expensive trades)
+    uint256 public constant MAX_COMMITTEE_SIZE = 64;
+
+    /// @notice Value unit for committee scaling ($100 USDC)
+    /// @dev Committee grows by ~1 for each doubling above this base value
+    uint256 public constant COMMITTEE_VALUE_UNIT = 100e6;
+
+    /// @notice Commit phase duration
+    uint256 public constant COMMIT_WINDOW = 30 minutes;
+
+    /// @notice Reveal phase duration
+    uint256 public constant REVEAL_WINDOW = 15 minutes;
+
+    /// @notice Maximum stake share per entity (10%)
+    uint256 public constant MAX_STAKE_SHARE_BPS = 1000;
+
+    /// @notice Minority warning threshold (5%)
+    uint256 public constant MINORITY_WARNING_BPS = 500;
+
+    /// @notice Minority suspension threshold (10%)
+    uint256 public constant MINORITY_SUSPEND_BPS = 1000;
+
+    /// @notice Minority slash threshold (15%)
+    uint256 public constant MINORITY_SLASH_BPS = 1500;
+
+    /// @notice Minimum votes before minority analysis
+    uint256 public constant MIN_VOTES_FOR_MINORITY_ANALYSIS = 20;
+
+    /// @notice Participation warning threshold (90%)
+    uint256 public constant PARTICIPATION_WARNING_BPS = 9000;
+
+    /// @notice Participation suspension threshold (80%)
+    uint256 public constant PARTICIPATION_SUSPEND_BPS = 8000;
+
+    /// @notice Participation slash threshold (60%)
+    uint256 public constant PARTICIPATION_SLASH_BPS = 6000;
+
+    /// @notice Minimum assignments before participation analysis
+    uint256 public constant MIN_ASSIGNMENTS_FOR_PARTICIPATION_ANALYSIS = 30;
+
+    /// @notice Selective abstention detection thresholds
+    uint256 public constant SELECTIVE_ABSTENTION_MINORITY_BPS = 1000; // 10%
+    uint256 public constant SELECTIVE_ABSTENTION_PARTICIPATION_BPS = 7000; // 70%
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SELF-SELECTION PARAMETERS (Algorand-style sortition)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Expected committee size (τ) - fixed regardless of network size
+    /// @dev τ=7 with QUORUM=5 gives ~99.7% liveness at 90% participation
+    uint256 public constant EXPECTED_COMMITTEE_SIZE = 7;
+
+    /// @notice Quorum required for consensus (must be < τ)
+    uint256 public constant QUORUM = 5;
+
+    /// @notice Maximum retry rounds before batch fails
+    uint256 public constant MAX_ROUNDS = 3;
+
+    /// @notice Number of stake buckets (log₂ scale from MIN_STAKE)
+    /// @dev 14 buckets: MIN_STAKE × 2^i, covers $1K to $16M
+    uint256 public constant MAX_BUCKETS = 14;
+
+    /// @notice Bucket base equals MIN_STAKE for aligned boundaries
+    uint256 public constant BUCKET_BASE = MIN_STAKE; // 1000e6
+
+    /// @notice Safety margin for cryptoeconomic security (α = 1.5 = 15000 BPS)
+    /// @dev min_stake = α × V / (QUORUM × slash_rate)
+    uint256 public constant SECURITY_MARGIN_BPS = 15000;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DYNAMIC COMMITTEE SIZING (scales logarithmically with network size)
+    // Formula: min(n, max(MIN_COMMITTEE_SIZE, LOG_COEFFICIENT * log2(n)))
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Logarithmic coefficient for committee scaling
+    /// @dev Higher = larger committees = more security but more gas
+    uint256 public constant LOG_COEFFICIENT = 6;
+
+    /// @notice Buffer added to threshold for over-selection
+    uint256 public constant OVER_SELECTION_BUFFER = 2;
+
+    /// @notice Maximum retry attempts per batch
+    uint256 public constant MAX_BATCH_RETRIES = 2;
+
+    /// @notice Timeout after max retries before auto-refund
+    uint256 public constant BATCH_FAILURE_TIMEOUT = 24 hours;
+
+    /// @notice Fee split: 90% to voters (majority voters who reached consensus)
+    uint256 public constant VERIFIER_SHARE_BPS = 9000;
+
+    /// @notice Fee split: 10% to batch creator (incentivizes permissionless batch creation)
+    uint256 public constant CREATOR_SHARE_BPS = 1000;
+
+    /// @notice Executor bonus: 5% of verifier pool (compensates gas for triggering execution)
+    uint256 public constant EXECUTOR_BONUS_BPS = 500;
+
+    /// @notice Unbonding cooldown period (Chainlink v0.2 pattern)
+    uint256 public constant UNBONDING_PERIOD = 28 days;
+
+    /// @notice Claim window after unbonding completes
+    uint256 public constant CLAIM_WINDOW = 7 days;
+
+    /// @notice Audit challenge window after batch execution
+    uint256 public constant AUDIT_CHALLENGE_WINDOW = 2 hours;
+
+    /// @notice Audit resolution deadline (UMA DVM-style)
+    uint256 public constant AUDIT_RESOLUTION_DEADLINE = 72 hours;
+
+    /// @notice Audit bond (5% of batch value, minimum $100)
+    uint256 public constant AUDIT_BOND_BPS = 500;
+    uint256 public constant MIN_AUDIT_BOND = 100e6;
+
+    /// @notice Random audit selection rate (1%)
+    uint256 public constant AUDIT_SAMPLE_RATE_BPS = 100;
+
+    /// @notice Slashing cap per minority vote incident (5%, Pyth pattern)
+    /// @dev Used for gradual correctness incentive without harsh punishment
+    uint256 public constant SLASH_MINORITY_BPS = 500;
+
+    /// @notice Slashing rate for audit failures (100% = full stake)
+    /// @dev From STAKESURE paper: higher σ = stronger cryptoeconomic security
+    ///      Security constraint: k × S_avg × σ ≥ 1.5 × V (batch value)
+    ///      With σ = 100%, we maximize the bribery cost for attackers
+    /// @custom:formula Cost of Corruption = (2/3) × S_committee × σ
+    uint256 public constant SLASH_AUDIT_FAIL_BPS = 10000;
+
+    /// @notice Legacy alias for backwards compatibility
+    uint256 public constant SLASH_CAP_BPS = SLASH_MINORITY_BPS;
+
+    /// @notice BPS denominator
+    uint256 private constant BPS = 10000;
+
+    /// @notice Default batch deposit (anti-spam + verifier guarantee)
+    /// @dev 0.05 USDC - covers verifier gas costs for small/unprofitable batches
+    uint256 public constant DEFAULT_BATCH_DEPOSIT = 50000; // 0.05 USDC (6 decimals)
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // IMMUTABLES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice USDC token for staking
+    IERC20 public immutable usdc;
+
+    /// @notice JJSKIN escrow contract
+    address public immutable jjskin;
+
+    /// @notice Extension contract for overflow functions (CometExt pattern)
+    address public immutable extensionDelegate;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VRF CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice VRF subscription ID
+    uint256 public s_subscriptionId;
+
+    /// @notice VRF key hash (gas lane)
+    bytes32 public s_keyHash;
+
+    /// @notice VRF callback gas limit
+    uint32 public s_callbackGasLimit = 100000;
+
+    /// @notice VRF request confirmations
+    uint16 public s_requestConfirmations = 3;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Total USDC staked by all verifiers (excludes unbonding)
+    uint256 public totalStake;
+
+    /// @notice Count of active verifiers
+    uint256 public activeVerifierCount;
+
+    /// @notice Current epoch number
+    uint256 public currentEpoch;
+
+    /// @notice Slashing treasury (slashed funds held for DAO allocation)
+    uint256 public slashingTreasury;
+
+    /// @notice Treasury beneficiary address
+    address public treasuryBeneficiary;
+
+    /// @notice Batch deposit amount (configurable based on gas costs)
+    uint256 public batchDeposit = DEFAULT_BATCH_DEPOSIT;
+
+    /// @notice Verifier data by address
+    mapping(address => Verifier) public verifiers;
+
+    /// @notice List of active verifier addresses
+    address[] public activeVerifierList;
+
+    /// @notice Index in activeVerifierList (for O(1) removal)
+    mapping(address => uint256) private verifierIndex;
+
+    /// @notice Batch data by batch ID
+    mapping(bytes32 => Batch) public batches;
+
+    /// @notice Audit batch metadata (separate from Batch to reduce struct size)
+    mapping(bytes32 => AuditBatchMeta) public auditBatchMeta;
+
+    /// @notice Commitment hashes: batchId => verifier => commitHash
+    /// @dev Commit is hash of AssetDecision[] array
+    mapping(bytes32 => mapping(address => bytes32)) public commits;
+
+    /// @notice Whether verifier revealed: batchId => verifier => bool
+    mapping(bytes32 => mapping(address => bool)) public hasRevealed;
+
+    /// @notice Voters for a batch (for iteration)
+    mapping(bytes32 => address[]) public batchVoters;
+
+    // ─────────────────────────────────────────────────────────────────
+    // PER-ASSET VOTE TRACKING (each asset in batch needs own consensus)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// @notice Per-asset votes: batchId => assetId => verifier => AssetDecision
+    mapping(bytes32 => mapping(uint64 => mapping(address => AssetDecision))) public assetVotes;
+
+    /// @notice Vote counts per decision: batchId => assetId => Decision => count
+    mapping(bytes32 => mapping(uint64 => mapping(Decision => uint8))) public assetVoteCounts;
+
+    /// @notice Refund reason votes: batchId => assetId => RefundReason => count
+    /// @dev Only counted when verifier votes REFUND
+    mapping(bytes32 => mapping(uint64 => mapping(RefundReason => uint8))) public assetRefundReasonCounts;
+
+    /// @notice Final consensus per asset: batchId => assetId => AssetConsensus
+    mapping(bytes32 => mapping(uint64 => AssetConsensus)) public assetConsensus;
+
+    /// @notice Epoch data
+    mapping(uint256 => Epoch) public epochs;
+
+    /// @notice Selected verifiers for epoch (permissionless mode)
+    mapping(uint256 => address[]) public epochVerifiers;
+
+    /// @notice Batches created in each epoch (for retrospective audit)
+    /// @dev New epoch's VRF seed audits PREVIOUS epoch's batches (unpredictable!)
+    mapping(uint256 => bytes32[]) public epochBatches;
+
+    /// @notice VRF request ID to epoch mapping
+    mapping(uint256 => uint256) public vrfRequestToEpoch;
+
+    /// @notice Audit data by batch ID
+    mapping(bytes32 => Audit) public audits;
+
+    /// @notice Verifiers assigned to a specific batch (permissionless mode)
+    mapping(bytes32 => address[]) public batchAssignedVerifiers;
+
+    /// @notice Quick lookup for verifier assignment (O(1) instead of O(n))
+    mapping(bytes32 => mapping(address => bool)) public batchVerifierAssigned;
+
+    /// @notice Track verifiers who didn't respond for a batch
+    mapping(bytes32 => mapping(address => bool)) public batchNonResponders;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ARWEAVE PROOF STORAGE & SPAM PROTECTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Maximum assets per batch (matches JJSKIN.MAX_BATCH_SIZE)
+    /// @dev Limited by block gas limit for storage operations. 200 is safe on Arbitrum.
+    uint256 public constant MAX_BATCH_SIZE = 200;
+
+    /// @notice Track assets currently in pending batches to prevent concurrent batches
+    /// @dev assetId => batchId (bytes32(0) if none pending)
+    mapping(uint64 => bytes32) public pendingAssets;
+
+    /// @notice Track settled assets to prevent double-settlement
+    /// @dev assetId => settled (bool) - only set on CLAIM/REFUND, not INVALID
+    mapping(uint64 => bool) public settledAssets;
+
+    /// @notice Pending rewards for non-verifier creators
+    /// @dev Separate from Verifier.pendingRewards for non-verifier participants
+    mapping(address => uint256) public nonVerifierRewards;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SELECTION BUCKET SNAPSHOT (epoch-locked, prevents grinding)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Total selection stake in each bucket (SNAPSHOT - updated at epoch roll only)
+    /// @dev bucketStakeSumSel[i] = sum of selectionStakes where BUCKET_BASE × 2^i <= stake < BUCKET_BASE × 2^(i+1)
+    /// @dev CRITICAL: This is NOT updated by staking functions, only by _rollSelectionSnapshot()
+    uint256[14] public bucketStakeSumSel;
+
+    /// @notice Total selection stake across all verifiers (SNAPSHOT)
+    /// @dev Used for batch cap calculation
+    uint256 public totalSelectionStake;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EPOCH MANAGEMENT (single pending epoch prevents DoS)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Active epoch with fulfilled VRF (used for batch selection)
+    uint256 public activeEpoch;
+
+    /// @notice Pending epoch awaiting VRF fulfillment (0 if none pending)
+    /// @dev Only one pending epoch allowed at a time
+    uint256 public pendingEpoch;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PER-BATCH PARTICIPATION TRACKING (one participation per batch)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Round when verifier committed (0 = never committed to this batch)
+    /// @dev batchId => verifier => round+1 (0 means no commit ever)
+    /// @dev IMPORTANT: Once committed to any round, cannot commit again for this batch
+    mapping(bytes32 => mapping(address => uint8)) public committedRoundPlus1;
+
+    /// @notice Round when verifier revealed (0 = never revealed for this batch)
+    /// @dev batchId => verifier => round+1 (0 means no reveal ever)
+    mapping(bytes32 => mapping(address => uint8)) public revealedRoundPlus1;
+
+    /// @notice Committers per round (for metrics/iteration)
+    /// @dev batchId => round => committer addresses
+    mapping(bytes32 => mapping(uint8 => address[])) public roundCommitters;
+
+    /// @notice Vote counts per round (for per-round consensus check)
+    /// @dev batchId => round => assetId => Decision => count
+    mapping(bytes32 => mapping(uint8 => mapping(uint64 => mapping(Decision => uint8)))) public assetVoteCountsR;
+
+    /// @notice Refund reason counts per round
+    /// @dev batchId => round => assetId => RefundReason => count
+    mapping(bytes32 => mapping(uint8 => mapping(uint64 => mapping(RefundReason => uint8)))) public assetRefundReasonCountsR;
+
+    // NOTE: No pause mechanism - fully trustless, unstoppable oracle
+    // If contract has issues, deploy new VerifierNetwork + new JJSKIN
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event VerifierRegistered(address indexed verifier, uint256 stake);
+    event VerifierStakeUpdated(address indexed verifier, uint256 newStake);
+    event VerifierSlashed(address indexed verifier, uint256 amount, string reason);
+
+    event UnbondingInitiated(address indexed verifier, uint256 amount, uint40 cooldownEnds);
+    event UnbondingClaimed(address indexed verifier, uint256 amount);
+    event UnbondingCancelled(address indexed verifier, uint256 amount);
+
+    event BatchCreated(bytes32 indexed batchId, uint64[] assetIds, uint256 totalValue);
+    event CommitSubmitted(bytes32 indexed batchId, address indexed verifier);
+    event RevealSubmitted(bytes32 indexed batchId, address indexed verifier, uint256 assetCount);
+    event AssetVoteRecorded(bytes32 indexed batchId, uint64 indexed assetId, address indexed verifier, Decision decision);
+    event AssetConsensusReached(bytes32 indexed batchId, uint64 indexed assetId, Decision decision, RefundReason reason);
+    event BatchExecuted(bytes32 indexed batchId, uint256 claimCount, uint256 refundCount, address indexed creator);
+
+    event EpochStarted(uint256 indexed epoch, uint256 vrfRequestId);
+    event EpochFulfilled(uint256 indexed epoch, address[] selectedVerifiers);
+
+    event RewardsDistributed(bytes32 indexed batchId, uint256 totalFees);
+    event RewardClaimed(address indexed verifier, uint256 amount);
+    event BatchDepositUpdated(uint256 newDeposit);
+
+    event AuditSelected(bytes32 indexed batchId);
+    event AuditChallenged(bytes32 indexed batchId, address indexed challenger, uint256 bond, Decision claimedTruth);
+    event AuditResolved(
+        bytes32 indexed originalBatchId,
+        bytes32 indexed auditBatchId,
+        bool originalWasWrong,
+        uint256 wrongAssetCount
+    );
+
+    event TreasuryWithdraw(address indexed to, uint256 amount);
+    event MinorityWarning(address indexed verifier, uint256 minorityRate);
+    event ParticipationWarning(address indexed verifier, uint256 participationRate);
+    event SelectiveAbstentionDetected(address indexed verifier, uint256 minorityRate, uint256 participationRate);
+    event VerifierSuspended(address indexed verifier, string reason);
+    event VRFConfigUpdated(uint256 subscriptionId, bytes32 keyHash);
+    event BatchRetried(bytes32 indexed batchId, uint8 retryCount, address[] newVerifiers);
+    event BatchFailed(bytes32 indexed batchId, string reason);
+    event VerifierNonResponse(address indexed verifier, bytes32 indexed batchId);
+    event NonRevealMinorityPenalty(address indexed verifier, bytes32 indexed batchId, uint256 assetCount);
+
+    // Arweave batch events
+    event ArweaveBatchCreated(
+        bytes32 indexed batchId,
+        uint64[] assetIds,
+        uint64 arweaveBlock,
+        uint256 totalValue,
+        address indexed creator
+    );
+    event BatchSettled(bytes32 indexed batchId, Decision decision, uint64[] assetIds);
+    event BatchInvalid(bytes32 indexed batchId, uint64[] assetIds);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ERRORS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    error InsufficientStake(uint256 provided, uint256 required);
+    error StakeExceedsMax(uint256 provided, uint256 maxAllowed);
+    error NotActiveVerifier();
+    error AlreadyRegistered();
+    error NotEnoughVerifiers(uint256 current, uint256 required);
+    error BatchNotFound();
+    error InvalidBatchState(BatchState current, BatchState expected);
+    error NotSelectedVerifier();
+    error AlreadyCommitted();
+    error AlreadyRevealed();
+    error CommitHashMismatch();
+    error ThresholdNotMet(uint256 votes, uint256 required);
+    error BatchCapExceeded(uint256 value, uint256 cap);
+    // ZeroAddress inherited from VRFConsumerBaseV2Plus
+    error InvalidInput();
+    error UnbondingInProgress();
+    error NoUnbondingRequest();
+    error CooldownNotComplete();
+    error ClaimWindowExpired();
+    error AuditWindowClosed();
+    error InsufficientTreasury();
+    error InsufficientBond(uint256 provided, uint256 required);
+    error MaxRetriesExceeded();
+    error RetryNotNeeded();
+    error BatchTimedOut();
+    error VRFNotReady();
+    error DecisionCountMismatch(uint256 provided, uint256 expected);
+    error InvalidAssetId(uint64 assetId);
+    error BatchNotReady();
+
+    // Arweave batch errors
+    error ProofAlreadyProcessed(bytes32 arweaveTxId);
+    error AssetAlreadySettled(uint64 assetId);
+    error AssetInPendingBatch(uint64 assetId, bytes32 existingBatchId);
+    error AssetNotPending(uint64 assetId);
+    error AssetNotReady(uint64 assetId, uint256 readyAt);  // Asset not past delivery deadline
+    error LengthMismatch();
+    error EmptyBatch();
+    error BatchTooLarge(uint256 provided, uint256 max);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTRUCTOR
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @param _usdc USDC token address
+     * @param _jjskin JJSKIN escrow contract address
+     * @param _vrfCoordinator Chainlink VRF Coordinator address
+     */
+    constructor(
+        address _usdc,
+        address _jjskin,
+        address _vrfCoordinator,
+        address _extensionDelegate
+    ) VRFConsumerBaseV2Plus(_vrfCoordinator) {
+        if (_usdc == address(0) || _jjskin == address(0) || _extensionDelegate == address(0)) revert ZeroAddress();
+        usdc = IERC20(_usdc);
+        jjskin = _jjskin;
+        extensionDelegate = _extensionDelegate;
+    }
+
+    /// @notice Fallback delegates to extension contract for overflow functions
+    fallback() external {
+        address delegate = extensionDelegate;
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), delegate, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // THRESHOLD & CAP CALCULATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice PBFT threshold: T = ceil((2n+1)/3)
+     * @dev Ensures >2/3 supermajority for Byzantine fault tolerance
+     */
+    function getThreshold() public view returns (uint256) {
+        uint256 n = activeVerifierCount;
+        if (n < MIN_ORACLE_COUNT) revert NotEnoughVerifiers(n, MIN_ORACLE_COUNT);
+        return (2 * n + 3) / 3; // Ceiling of (2n+1)/3
+    }
+
+    /**
+     * @notice Dynamic batch cap based on stake and cryptoeconomic security
+     * @dev Two constraints apply (takes the minimum):
+     *
+     *      1. Legacy cap (stake coverage):
+     *         V_max = (threshold/total) × totalStake
+     *
+     *      2. Cryptoeconomic security (from STAKESURE paper):
+     *         V_max = (2/3) × S_committee × σ
+     *
+     *         Where σ = SLASH_AUDIT_FAIL_BPS / 10000 = 1.0 (100% slashing)
+     *
+     * @custom:formula V_max = (2/3) × k × S_avg × σ
+     * @custom:reference STAKESURE: arXiv:2401.05797
+     */
+    function getBatchCap() public view returns (uint256) {
+        if (activeVerifierCount == 0) return 0;
+
+        // Legacy cap: based on threshold proportion of total stake
+        uint256 legacyCap = (totalStake * getThreshold()) / activeVerifierCount;
+
+        // Cryptoeconomic cap: V_max = (2/3) × totalStake × σ
+        // Using totalStake as maximum possible committee stake
+        uint256 cryptoCap = CryptoeconomicSecurity.maxBatchValue(totalStake, SLASH_AUDIT_FAIL_BPS);
+
+        // Return the more conservative (lower) cap
+        return legacyCap < cryptoCap ? legacyCap : cryptoCap;
+    }
+
+    /**
+     * @notice Calculate required committee configuration for a batch value
+     * @dev Based on STAKESURE cryptoeconomic security model:
+     *
+     *      Security constraint: k × S_avg × σ ≥ 1.5 × V
+     *
+     *      Where:
+     *        k = committee size
+     *        S_avg = average stake per verifier
+     *        σ = slashing rate (SLASH_AUDIT_FAIL_BPS / 10000)
+     *        V = batch value
+     *
+     * @param batchValue The total value of assets in the batch
+     * @return minStake Minimum total committee stake required
+     * @return minSize Minimum number of committee members
+     * @return isSecure Whether current network can handle this batch
+     *
+     * @custom:formula S_committee ≥ 1.5V / σ
+     * @custom:formula k ≥ 1.5V / (σ × S_avg)
+     */
+    function getRequiredCommittee(uint256 batchValue) public view returns (
+        uint256 minStake,
+        uint256 minSize,
+        bool isSecure
+    ) {
+        minStake = CryptoeconomicSecurity.minCommitteeStake(batchValue, SLASH_AUDIT_FAIL_BPS);
+
+        uint256 avgStake = activeVerifierCount > 0 ? totalStake / activeVerifierCount : 0;
+        minSize = CryptoeconomicSecurity.minCommitteeSize(batchValue, avgStake, SLASH_AUDIT_FAIL_BPS);
+
+        // Check if network has sufficient resources
+        isSecure = totalStake >= minStake && activeVerifierCount >= minSize;
+    }
+
+    /**
+     * @notice Check if a batch value is cryptoeconomically secure with current network
+     * @dev Validates: (2/3) × S_committee × σ ≥ V
+     *
+     * @param batchValue The proposed batch value
+     * @param committeeStake The total stake of assigned committee
+     * @return secure True if the batch can be securely processed
+     *
+     * @custom:formula Security requires CoC > PoC where CoC = (2/3) × S × σ
+     */
+    function isBatchSecure(uint256 batchValue, uint256 committeeStake) public pure returns (bool) {
+        return CryptoeconomicSecurity.isSecure(batchValue, committeeStake, SLASH_AUDIT_FAIL_BPS);
+    }
+
+    /**
+     * @notice Calculate the bribery cost to corrupt a committee
+     * @dev From game theory: rational attack requires bribe > slashing cost
+     *
+     * @param committeeSize Number of verifiers in committee
+     * @return cost Minimum USDC cost to bribe the committee
+     *
+     * @custom:formula Cost = T × S_avg × σ where T = ⌈2k/3⌉
+     */
+    function getBriberyCost(uint256 committeeSize) public view returns (uint256) {
+        if (activeVerifierCount == 0) return 0;
+        uint256 avgStake = totalStake / activeVerifierCount;
+        return CryptoeconomicSecurity.briberyCost(committeeSize, avgStake, SLASH_AUDIT_FAIL_BPS);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STAKING (REGISTRATION)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Register as a verifier with stake
+     * @param amount USDC amount to stake (must be >= MIN_STAKE)
+     */
+    function registerVerifier(uint256 amount) external nonReentrant {
+        if (verifiers[msg.sender].isActive) revert AlreadyRegistered();
+        if (amount < MIN_STAKE) revert InsufficientStake(amount, MIN_STAKE);
+
+        // Check stake concentration (max 10% of total after this stake)
+        // Only applies once network has sufficient decentralization (10+ verifiers)
+        // This allows organic bootstrap while preventing whale dominance at scale
+        // @custom:security See CRYPTOECONOMIC_SECURITY.md for analysis
+        if (activeVerifierCount >= CONCENTRATION_ENFORCEMENT_MIN) {
+            uint256 newTotal = totalStake + amount;
+            uint256 maxAllowed = (newTotal * MAX_STAKE_SHARE_BPS) / BPS;
+            // Check verifier's TOTAL stake (existing + new), not just new amount
+            uint256 verifierFinalStake = verifiers[msg.sender].stakedAmount + amount;
+            if (verifierFinalStake > maxAllowed) revert StakeExceedsMax(verifierFinalStake, maxAllowed);
+        }
+
+        // Transfer stake
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Register verifier
+        verifiers[msg.sender] = Verifier({
+            stakedAmount: amount,
+            unbondingAmount: 0,
+            pendingRewards: 0,
+            minorityVotes: 0,
+            totalVotes: 0,
+            assignedBatches: 0,
+            registeredAt: uint40(block.timestamp),
+            lastSlashTime: 0,
+            unbondingStart: 0,
+            minorityWarnings: 0,
+            participationWarnings: 0,
+            isActive: true
+        });
+
+        // Add to active list
+        verifierIndex[msg.sender] = activeVerifierList.length;
+        activeVerifierList.push(msg.sender);
+        activeVerifierCount++;
+        totalStake += amount;
+
+        emit VerifierRegistered(msg.sender, amount);
+    }
+
+    /**
+     * @notice Add more stake to existing registration
+     * @param amount Additional USDC to stake
+     */
+    function addStake(uint256 amount) external nonReentrant {
+        Verifier storage v = verifiers[msg.sender];
+        if (!v.isActive) revert NotActiveVerifier();
+
+        // Check stake concentration (only after network has 10+ verifiers)
+        // @custom:security See CRYPTOECONOMIC_SECURITY.md for analysis
+        uint256 newStake = v.stakedAmount + amount;
+        if (activeVerifierCount >= CONCENTRATION_ENFORCEMENT_MIN) {
+            uint256 newTotal = totalStake + amount;
+            uint256 maxAllowed = (newTotal * MAX_STAKE_SHARE_BPS) / BPS;
+            if (newStake > maxAllowed) revert StakeExceedsMax(newStake, maxAllowed);
+        }
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        v.stakedAmount = newStake;
+        totalStake += amount;
+
+        emit VerifierStakeUpdated(msg.sender, newStake);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UNBONDING (28 DAYS + 7 DAY CLAIM WINDOW)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Initiate unstaking with 28-day cooldown
+     * @dev During cooldown, stake can still be slashed but doesn't count for voting
+     * @param amount Amount to unstake (can be partial or full)
+     */
+    function initiateUnbonding(uint256 amount) external nonReentrant {
+        Verifier storage v = verifiers[msg.sender];
+        if (!v.isActive) revert NotActiveVerifier();
+        if (amount > v.stakedAmount) revert InsufficientStake(v.stakedAmount, amount);
+        if (v.unbondingAmount > 0) revert UnbondingInProgress();
+
+        // Ensure minimum stake remains (or full exit)
+        uint256 remaining = v.stakedAmount - amount;
+        if (remaining > 0 && remaining < MIN_STAKE) {
+            revert InsufficientStake(remaining, MIN_STAKE);
+        }
+
+        // Move stake to unbonding
+        v.stakedAmount -= amount;
+        v.unbondingAmount = amount;
+        v.unbondingStart = uint40(block.timestamp);
+        totalStake -= amount;
+
+        // If fully exiting, mark inactive
+        if (v.stakedAmount == 0) {
+            v.isActive = false;
+            activeVerifierCount--;
+            _removeFromActiveList(msg.sender);
+        }
+
+        emit UnbondingInitiated(
+            msg.sender,
+            amount,
+            uint40(block.timestamp + UNBONDING_PERIOD)
+        );
+    }
+
+    /**
+     * @notice Claim unbonded stake after cooldown
+     * @dev Must claim within 7-day window or stake auto-restakes
+     */
+    function claimUnbonding() external nonReentrant {
+        Verifier storage v = verifiers[msg.sender];
+        if (v.unbondingAmount == 0) revert NoUnbondingRequest();
+
+        uint256 cooldownEnd = v.unbondingStart + UNBONDING_PERIOD;
+        uint256 claimEnd = cooldownEnd + CLAIM_WINDOW;
+
+        if (block.timestamp < cooldownEnd) revert CooldownNotComplete();
+
+        if (block.timestamp > claimEnd) {
+            // Missed claim window - auto-restake
+            _restake(msg.sender, v.unbondingAmount);
+            v.unbondingAmount = 0;
+            v.unbondingStart = 0;
+            emit UnbondingCancelled(msg.sender, v.unbondingAmount);
+            return;
+        }
+
+        uint256 amount = v.unbondingAmount;
+        v.unbondingAmount = 0;
+        v.unbondingStart = 0;
+
+        usdc.safeTransfer(msg.sender, amount);
+        emit UnbondingClaimed(msg.sender, amount);
+    }
+
+    /**
+     * @notice Cancel unbonding and restake
+     */
+    function cancelUnbonding() external nonReentrant {
+        Verifier storage v = verifiers[msg.sender];
+        if (v.unbondingAmount == 0) revert NoUnbondingRequest();
+
+        uint256 amount = v.unbondingAmount;
+        v.unbondingAmount = 0;
+        v.unbondingStart = 0;
+
+        _restake(msg.sender, amount);
+        emit UnbondingCancelled(msg.sender, amount);
+    }
+
+    /**
+     * @notice Internal: restake unbonding amount
+     */
+    function _restake(address verifier, uint256 amount) internal {
+        Verifier storage v = verifiers[verifier];
+        v.stakedAmount += amount;
+        totalStake += amount;
+
+        if (!v.isActive && v.stakedAmount >= MIN_STAKE) {
+            v.isActive = true;
+            activeVerifierCount++;
+            _addToActiveList(verifier);
+        }
+    }
+
+    function _addToActiveList(address verifier) internal {
+        verifierIndex[verifier] = activeVerifierList.length;
+        activeVerifierList.push(verifier);
+    }
+
+    function _removeFromActiveList(address verifier) internal {
+        uint256 idx = verifierIndex[verifier];
+        uint256 lastIdx = activeVerifierList.length - 1;
+        if (idx != lastIdx) {
+            address lastVerifier = activeVerifierList[lastIdx];
+            activeVerifierList[idx] = lastVerifier;
+            verifierIndex[lastVerifier] = idx;
+        }
+        activeVerifierList.pop();
+        delete verifierIndex[verifier];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BATCH CREATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Create a batch from Arweave-stored proofs (permissionless)
+     * @dev OPTIMIZED: No arweaveTxIds calldata - verifiers query Arweave by tags
+     *      Contract validates via JJSKIN.getBatchAssetInfo() in single call
+     *      Enforces delivery window elapsed (seller had time to send trade)
+     *
+     * Spam Protection:
+     * 1. pendingAssets[assetId] - prevents concurrent batches for same asset
+     * 2. settledAssets[assetId] - prevents double-settlement
+     * 3. JJSKIN state check - ensures asset is actually pending in escrow
+     * 4. deliveryWindow check - seller had time to complete trade
+     *
+     * INVALID Handling:
+     * - If verifiers vote INVALID, pendingAssets is cleared but settledAssets is NOT set
+     * - This allows legitimate proofs to be submitted for retry
+     *
+     * @param assetIds Array of asset IDs to settle
+     * @param arweaveBlock Arweave block height for deterministic proof queries
+     * @return batchId Unique batch identifier
+     */
+    function createBatchFromArweave(
+        uint64[] calldata assetIds,
+        uint64 arweaveBlock
+    ) external returns (bytes32 batchId) {
+        // Validate inputs
+        if (assetIds.length == 0) revert EmptyBatch();
+        if (assetIds.length > MAX_BATCH_SIZE) {
+            revert BatchTooLarge(assetIds.length, MAX_BATCH_SIZE);
+        }
+
+        // Require VRF seed for verifier selection
+        if (epochs[currentEpoch].randomSeed == 0) revert VRFNotReady();
+
+        // Fetch batch asset info from JJSKIN in single call (gas efficient)
+        (
+            uint56[] memory prices,
+            uint40[] memory purchaseTimes,
+            IJJSKIN.PurchaseStatus[] memory statuses
+        ) = IJJSKIN(jjskin).getBatchAssetInfo(assetIds);
+
+        // Get delivery window for timing check
+        uint256 _deliveryWindow = IJJSKIN(jjskin).deliveryWindow();
+
+        // Calculate total value and validate each asset
+        uint256 totalValue = 0;
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+
+            // 1. Asset must be Active (escrow exists, not settled)
+            if (statuses[i] != IJJSKIN.PurchaseStatus.Active) {
+                revert AssetNotPending(assetId);
+            }
+
+            // 2. Delivery window must have elapsed (seller had time to send trade)
+            uint256 readyAt = purchaseTimes[i] + _deliveryWindow;
+            if (block.timestamp < readyAt) {
+                revert AssetNotReady(assetId, readyAt);
+            }
+
+            // 3. Asset not already settled via VerifierNetwork
+            if (settledAssets[assetId]) {
+                revert AssetAlreadySettled(assetId);
+            }
+
+            // 4. Asset not in another pending batch
+            bytes32 existingBatch = pendingAssets[assetId];
+            if (existingBatch != bytes32(0)) {
+                revert AssetInPendingBatch(assetId, existingBatch);
+            }
+
+            // Accumulate total value
+            totalValue += prices[i];
+        }
+
+        // Check batch cap
+        uint256 cap = getBatchCap();
+        if (totalValue > cap) revert BatchCapExceeded(totalValue, cap);
+
+        // Pull deposit from creator (anti-spam + verifier guarantee)
+        usdc.safeTransferFrom(msg.sender, address(this), batchDeposit);
+
+        // Generate unique batch ID (deterministic from inputs)
+        batchId = keccak256(abi.encode(assetIds, arweaveBlock, block.timestamp, msg.sender));
+
+        // Mark assets as pending in this batch
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            pendingAssets[assetIds[i]] = batchId;
+        }
+
+        // Create batch with optimized struct
+        Batch storage batch = batches[batchId];
+        batch.assetIds = assetIds;
+        batch.totalValue = uint128(totalValue);
+        batch.creatorDeposit = uint128(batchDeposit);
+        batch.commitDeadline = uint40(block.timestamp + COMMIT_WINDOW);
+        batch.revealDeadline = uint40(block.timestamp + COMMIT_WINDOW + REVEAL_WINDOW);
+        batch.createdAt = uint40(block.timestamp);
+        batch.state = BatchState.COMMIT_PHASE;
+        batch.retryCount = 0;
+        batch.creator = msg.sender;
+        batch.arweaveBlock = arweaveBlock;
+
+        // Assign verifiers for this batch using VRF
+        _assignVerifiersForBatch(batchId);
+
+        // Track batch in current epoch for retrospective audit
+        epochBatches[currentEpoch].push(batchId);
+
+        emit ArweaveBatchCreated(batchId, assetIds, arweaveBlock, totalValue, msg.sender);
+    }
+
+    /**
+     * @notice Assign verifiers for a batch using VRF seed
+     * @dev Selects threshold + OVER_SELECTION_BUFFER verifiers per batch
+     *      Uses current epoch's VRF seed for randomness
+     */
+    function _assignVerifiersForBatch(bytes32 batchId) internal {
+        uint256 seed = epochs[currentEpoch].randomSeed;
+        if (seed == 0) return; // VRF not yet fulfilled
+
+        uint256 n = activeVerifierList.length;
+        uint256 threshold = getThreshold();
+        uint256 selectCount = threshold + OVER_SELECTION_BUFFER;
+        if (selectCount > n) selectCount = n;
+
+        // Create shuffled selection using batchId for per-batch uniqueness
+        uint256[] memory indices = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            indices[i] = i;
+        }
+
+        // Fisher-Yates partial shuffle
+        for (uint256 i = 0; i < selectCount; i++) {
+            uint256 j = i + (uint256(keccak256(abi.encode(seed, batchId, i))) % (n - i));
+            (indices[i], indices[j]) = (indices[j], indices[i]);
+
+            address selected = activeVerifierList[indices[i]];
+            batchAssignedVerifiers[batchId].push(selected);
+            batchVerifierAssigned[batchId][selected] = true; // O(1) lookup
+            verifiers[selected].assignedBatches++;
+        }
+    }
+
+    /**
+     * @notice Check if a verifier is assigned to a specific batch
+     * @param batchId The batch to check
+     * @param verifier The verifier address
+     * @return True if assigned, false otherwise
+     */
+    function _isAssignedToBatch(bytes32 batchId, address verifier) internal view returns (bool) {
+        return batchVerifierAssigned[batchId][verifier]; // O(1) lookup
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMMIT-REVEAL VOTING (PER-ASSET DECISIONS)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Submit commitment hash for per-asset decisions
+     * @dev Commit is keccak256(abi.encode(AssetDecision[], salt))
+     *      Each AssetDecision contains: assetId, decision, refundReason
+     * @param batchId Batch to vote on
+     * @param commitHash keccak256(abi.encode(decisions, salt))
+     */
+    function submitCommit(bytes32 batchId, bytes32 commitHash) external {
+        Batch storage batch = batches[batchId];
+        if (batch.state != BatchState.COMMIT_PHASE) {
+            revert InvalidBatchState(batch.state, BatchState.COMMIT_PHASE);
+        }
+        if (block.timestamp > batch.commitDeadline) {
+            batch.state = BatchState.REVEAL_PHASE;
+            revert InvalidBatchState(BatchState.REVEAL_PHASE, BatchState.COMMIT_PHASE);
+        }
+
+        // Must be an active verifier AND assigned to this batch by VRF
+        Verifier storage v = verifiers[msg.sender];
+        if (!v.isActive) revert NotActiveVerifier();
+        if (!_isAssignedToBatch(batchId, msg.sender)) revert NotSelectedVerifier();
+        if (commits[batchId][msg.sender] != bytes32(0)) revert AlreadyCommitted();
+
+        commits[batchId][msg.sender] = commitHash;
+        emit CommitSubmitted(batchId, msg.sender);
+    }
+
+    /**
+     * @notice Reveal per-asset decisions
+     * @dev Each asset in the batch gets its own decision.
+     *      Identity is proven by msg.sender matching the commit submitter.
+     * @param batchId Batch ID
+     * @param decisions Array of AssetDecision (must cover all assets in batch)
+     * @param salt Random salt used in commitment
+     */
+    function submitReveal(
+        bytes32 batchId,
+        AssetDecision[] calldata decisions,
+        bytes32 salt
+    ) external {
+        Batch storage batch = batches[batchId];
+
+        // Auto-transition from commit to reveal
+        if (batch.state == BatchState.COMMIT_PHASE && block.timestamp > batch.commitDeadline) {
+            batch.state = BatchState.REVEAL_PHASE;
+        }
+
+        if (batch.state != BatchState.REVEAL_PHASE) {
+            revert InvalidBatchState(batch.state, BatchState.REVEAL_PHASE);
+        }
+        if (block.timestamp > batch.revealDeadline) {
+            batch.state = BatchState.READY;
+            revert InvalidBatchState(BatchState.READY, BatchState.REVEAL_PHASE);
+        }
+
+        if (hasRevealed[batchId][msg.sender]) revert AlreadyRevealed();
+
+        // Must have one decision per asset in batch
+        if (decisions.length != batch.assetIds.length) {
+            revert DecisionCountMismatch(decisions.length, batch.assetIds.length);
+        }
+
+        // Verify commitment (hash of decisions array + salt)
+        bytes32 expectedHash = keccak256(abi.encode(decisions, salt));
+        if (commits[batchId][msg.sender] != expectedHash) revert CommitHashMismatch();
+
+        // NOTE: msg.sender proves identity - same address that submitted commit
+        // No additional signature needed for commit-reveal
+        Verifier storage v = verifiers[msg.sender];
+
+        // Record vote
+        hasRevealed[batchId][msg.sender] = true;
+        batchVoters[batchId].push(msg.sender);
+        batch.revealCount++;
+        v.totalVotes++;
+
+        // Record per-asset votes
+        for (uint256 i = 0; i < decisions.length; i++) {
+            AssetDecision calldata d = decisions[i];
+
+            // Validate assetId matches batch (order must match)
+            if (d.assetId != batch.assetIds[i]) {
+                revert InvalidAssetId(d.assetId);
+            }
+
+            // Store individual vote
+            assetVotes[batchId][d.assetId][msg.sender] = d;
+
+            // Update vote counts
+            assetVoteCounts[batchId][d.assetId][d.decision]++;
+
+            // Track refund reason votes if decision is REFUND
+            if (d.decision == Decision.REFUND) {
+                assetRefundReasonCounts[batchId][d.assetId][d.refundReason]++;
+            }
+
+            emit AssetVoteRecorded(batchId, d.assetId, msg.sender, d.decision);
+        }
+
+        emit RevealSubmitted(batchId, msg.sender, decisions.length);
+
+        // AUTO-EXECUTE: Check if all assets have reached consensus
+        _tryAutoExecute(batchId);
+    }
+
+    /**
+     * @notice Internal: Try to auto-execute batch if ALL assets have consensus
+     * @dev Called after each reveal to check if consensus is reached
+     *      Option 1 design: Wait for ALL assets to reach consensus, then execute
+     *      If ANY asset can't reach consensus, whole batch must retry
+     */
+    function _tryAutoExecute(bytes32 batchId) internal {
+        Batch storage batch = batches[batchId];
+
+        // Already executed (shouldn't happen but safety check)
+        if (batch.state == BatchState.EXECUTED) return;
+
+        uint256 threshold = getThreshold();
+        uint64[] memory assetIds = batch.assetIds;
+
+        // Check if ALL assets have reached consensus
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+            AssetConsensus storage consensus = assetConsensus[batchId][assetId];
+
+            // Skip if already has consensus
+            if (consensus.hasConsensus) continue;
+
+            // Check each decision type for threshold
+            uint8 claimVotes = assetVoteCounts[batchId][assetId][Decision.CLAIM];
+            uint8 refundVotes = assetVoteCounts[batchId][assetId][Decision.REFUND];
+            uint8 invalidVotes = assetVoteCounts[batchId][assetId][Decision.INVALID];
+
+            if (claimVotes >= threshold) {
+                consensus.decision = Decision.CLAIM;
+                consensus.refundReason = RefundReason.None;
+                consensus.votesFor = claimVotes;
+                consensus.hasConsensus = true;
+                emit AssetConsensusReached(batchId, assetId, Decision.CLAIM, RefundReason.None);
+            } else if (refundVotes >= threshold) {
+                // Find the majority refund reason
+                RefundReason majorityReason = _getMajorityRefundReason(batchId, assetId);
+                consensus.decision = Decision.REFUND;
+                consensus.refundReason = majorityReason;
+                consensus.votesFor = refundVotes;
+                consensus.hasConsensus = true;
+                emit AssetConsensusReached(batchId, assetId, Decision.REFUND, majorityReason);
+            } else if (invalidVotes >= threshold) {
+                consensus.decision = Decision.INVALID;
+                consensus.refundReason = RefundReason.None;
+                consensus.votesFor = invalidVotes;
+                consensus.hasConsensus = true;
+                emit AssetConsensusReached(batchId, assetId, Decision.INVALID, RefundReason.None);
+            } else {
+                // This asset doesn't have consensus yet - can't execute batch
+                return;
+            }
+        }
+
+        // ALL assets have consensus - execute batch!
+        _executeBatchInternal(batchId);
+    }
+
+    /**
+     * @notice Get the majority refund reason for an asset
+     * @dev Called when REFUND decision reaches threshold
+     */
+    function _getMajorityRefundReason(bytes32 batchId, uint64 assetId) internal view returns (RefundReason) {
+        uint8 maxVotes = 0;
+        RefundReason majorityReason = RefundReason.None;
+
+        // Check each reason (skip None since that's for non-refunds)
+        uint8 failedDeliveryVotes = assetRefundReasonCounts[batchId][assetId][RefundReason.FailedDelivery];
+        if (failedDeliveryVotes > maxVotes) {
+            maxVotes = failedDeliveryVotes;
+            majorityReason = RefundReason.FailedDelivery;
+        }
+
+        uint8 tradeReversedVotes = assetRefundReasonCounts[batchId][assetId][RefundReason.TradeReversed];
+        if (tradeReversedVotes > maxVotes) {
+            maxVotes = tradeReversedVotes;
+            majorityReason = RefundReason.TradeReversed;
+        }
+
+        uint8 tradeDeclinedVotes = assetRefundReasonCounts[batchId][assetId][RefundReason.TradeDeclined];
+        if (tradeDeclinedVotes > maxVotes) {
+            maxVotes = tradeDeclinedVotes;
+            majorityReason = RefundReason.TradeDeclined;
+        }
+
+        uint8 expiredVotes = assetRefundReasonCounts[batchId][assetId][RefundReason.Expired];
+        if (expiredVotes > maxVotes) {
+            majorityReason = RefundReason.Expired;
+        }
+
+        return majorityReason;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BATCH EXECUTION (AUTO-TRIGGERED ON CONSENSUS)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Internal: Execute batch with per-asset decisions
+     * @dev Called automatically by _tryAutoExecute when ALL assets have consensus
+     *      Separates assets into claims, refunds, and invalids
+     *      For audit batches, calls _resolveAuditByVoting instead of JJSKIN execution
+     */
+    function _executeBatchInternal(bytes32 batchId) internal {
+        Batch storage batch = batches[batchId];
+
+        // Execute IMMEDIATELY
+        batch.state = BatchState.EXECUTED;
+        batch.executedAt = uint40(block.timestamp);
+        batch.executor = msg.sender; // Track who triggered execution (for gas bonus)
+
+        // AUDIT BATCH: Resolve by comparing with original consensus
+        if (batch.isAuditBatch) {
+            _resolveAuditByVoting(batchId);
+            return;
+        }
+
+        uint64[] memory assetIds = batch.assetIds;
+
+        // Categorize assets by decision
+        uint256 claimCount = 0;
+        uint256 refundCount = 0;
+        uint256 invalidCount = 0;
+
+        // Count each type first
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            Decision d = assetConsensus[batchId][assetIds[i]].decision;
+            if (d == Decision.CLAIM) claimCount++;
+            else if (d == Decision.REFUND) refundCount++;
+            else if (d == Decision.INVALID) invalidCount++;
+        }
+
+        // Build arrays for JJSKIN call
+        uint64[] memory claimAssets = new uint64[](claimCount);
+        uint64[] memory refundAssets = new uint64[](refundCount);
+        IJJSKIN.RefundReason[] memory refundReasons = new IJJSKIN.RefundReason[](refundCount);
+
+        uint256 claimIdx = 0;
+        uint256 refundIdx = 0;
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+            AssetConsensus storage consensus = assetConsensus[batchId][assetId];
+
+            if (consensus.decision == Decision.CLAIM) {
+                claimAssets[claimIdx++] = assetId;
+                // Mark as settled
+                settledAssets[assetId] = true;
+                pendingAssets[assetId] = bytes32(0);
+            } else if (consensus.decision == Decision.REFUND) {
+                refundAssets[refundIdx] = assetId;
+                // Map VerifierNetwork RefundReason to IJJSKIN RefundReason
+                refundReasons[refundIdx] = _mapRefundReason(consensus.refundReason);
+                refundIdx++;
+                // Mark as settled
+                settledAssets[assetId] = true;
+                pendingAssets[assetId] = bytes32(0);
+            } else {
+                // INVALID - only clear pending, don't mark settled (allows retry)
+                pendingAssets[assetId] = bytes32(0);
+            }
+
+            // Record minority voters for this asset's decision
+            _recordMinorityVotersForAsset(batchId, assetId, consensus.decision);
+        }
+
+        // Record non-reveal penalties ONCE for the entire batch (gas optimized)
+        // This is O(verifiers) instead of O(assets × verifiers)
+        _recordNonRevealPenalties(batchId, assetIds.length);
+
+        // Execute on JJSKIN using combined function
+        if (claimCount > 0 || refundCount > 0) {
+            _executeDecisions(claimAssets, refundAssets, refundReasons);
+        }
+
+        // Distribute rewards (only for CLAIM decisions)
+        if (claimCount > 0) {
+            _distributeRewards(batchId, claimCount);
+        }
+
+        // NOTE: Audit selection happens RETROSPECTIVELY in fulfillRandomWords()
+        // When new epoch starts, its VRF seed audits PREVIOUS epoch's batches
+        // This makes audit selection UNPREDICTABLE at voting time
+
+        if (invalidCount > 0) {
+            emit BatchInvalid(batchId, assetIds);
+        }
+        if (claimCount > 0 || refundCount > 0) {
+            emit BatchSettled(batchId, Decision.NONE, assetIds); // NONE because mixed
+        }
+
+        emit BatchExecuted(batchId, claimCount, refundCount, batch.creator);
+    }
+
+    /**
+     * @notice Map VerifierNetwork RefundReason to IJJSKIN RefundReason
+     * @dev Needed because they're separate enum types
+     */
+    function _mapRefundReason(RefundReason reason) internal pure returns (IJJSKIN.RefundReason) {
+        if (reason == RefundReason.FailedDelivery) return IJJSKIN.RefundReason.FailedDelivery;
+        if (reason == RefundReason.TradeReversed) return IJJSKIN.RefundReason.TradeReversed;
+        if (reason == RefundReason.TradeDeclined) return IJJSKIN.RefundReason.TradeDeclined;
+        return IJJSKIN.RefundReason.Expired; // Default to Expired
+    }
+
+    /**
+     * @notice Record minority voters for a specific asset's decision
+     * @dev Only tracks actual minority voters (those who revealed with wrong decision)
+     *      Non-reveal penalties are handled separately in _recordNonRevealPenalties
+     *      for gas efficiency (O(verifiers) instead of O(assets × verifiers))
+     */
+    function _recordMinorityVotersForAsset(bytes32 batchId, uint64 assetId, Decision majorityDecision) internal {
+        address[] storage voters = batchVoters[batchId];
+        for (uint256 i = 0; i < voters.length; i++) {
+            address voter = voters[i];
+            AssetDecision storage vote = assetVotes[batchId][assetId][voter];
+            if (vote.decision != majorityDecision && vote.decision != Decision.NONE) {
+                verifiers[voter].minorityVotes++;
+            }
+        }
+    }
+
+    /**
+     * @notice Record non-reveal penalties for the entire batch (gas optimized)
+     * @dev Called ONCE per batch instead of per-asset
+     *      Non-reveal is treated as minority vote on ALL assets to prevent gaming:
+     *      - Verifier commits, sees other reveals, realizes they're in minority
+     *      - Without penalty, they could skip reveal to avoid minority tracking
+     *      - With this penalty, non-reveal is WORSE than revealing a minority vote
+     *
+     * Gas savings: O(verifiers) instead of O(assets × verifiers)
+     * Example: 100 assets, 2 non-revealers
+     *   Before: 200 SSTOREs (minorityVotes++ per asset per non-revealer)
+     *   After:  2 SSTOREs (minorityVotes += assetCount per non-revealer)
+     */
+    function _recordNonRevealPenalties(bytes32 batchId, uint256 assetCount) internal {
+        address[] storage assigned = batchAssignedVerifiers[batchId];
+        for (uint256 i = 0; i < assigned.length; i++) {
+            address verifier = assigned[i];
+            // Committed but didn't reveal = minority vote on ALL assets
+            if (commits[batchId][verifier] != bytes32(0) && !hasRevealed[batchId][verifier]) {
+                Verifier storage v = verifiers[verifier];
+                v.minorityVotes += assetCount;
+                v.totalVotes += assetCount; // Must increment both to keep ratio accurate
+                emit NonRevealMinorityPenalty(verifier, batchId, assetCount);
+            }
+        }
+    }
+
+    /**
+     * @notice Resolve audit by comparing audit batch consensus with original
+     * @dev Called when an audit batch reaches consensus
+     *      If audit consensus differs from original, original verifiers were wrong
+     * @param auditBatchId The audit batch that just executed
+     */
+    function _resolveAuditByVoting(bytes32 auditBatchId) internal {
+        Batch storage auditBatch = batches[auditBatchId];
+        AuditBatchMeta storage meta = auditBatchMeta[auditBatchId];
+        bytes32 originalBatchId = meta.originalBatchId;
+        Audit storage audit = audits[originalBatchId];
+
+        uint64[] memory assetIds = auditBatch.assetIds;
+        uint256 wrongCount = 0;
+
+        // Compare each asset's audit consensus with original consensus
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+
+            Decision auditDecision = assetConsensus[auditBatchId][assetId].decision;
+            Decision originalDecision = assetConsensus[originalBatchId][assetId].decision;
+
+            if (auditDecision != originalDecision) {
+                wrongCount++;
+                // Slash original verifiers who voted for the wrong decision
+                _slashOriginalWrongVoters(originalBatchId, assetId, auditDecision);
+            }
+        }
+
+        bool originalWasWrong = wrongCount > 0;
+
+        // Handle challenger bond
+        address challenger = meta.challenger;
+        uint256 bond = auditBatch.creatorDeposit;  // Bond stored in creatorDeposit field
+
+        if (challenger != address(0) && bond > 0) {
+            if (originalWasWrong) {
+                // Challenger was right - return bond + reward from treasury
+                uint256 reward = bond;  // Double their bond
+                uint256 totalPayout = bond + reward;
+
+                if (slashingTreasury >= reward) {
+                    slashingTreasury -= reward;
+                } else {
+                    totalPayout = bond + slashingTreasury;
+                    slashingTreasury = 0;
+                }
+
+                usdc.safeTransfer(challenger, totalPayout);
+            } else {
+                // Challenger was wrong - forfeit bond to treasury
+                slashingTreasury += bond;
+            }
+        }
+
+        // Mark audit as resolved
+        audit.state = AuditState.RESOLVED;
+
+        emit AuditResolved(originalBatchId, auditBatchId, originalWasWrong, wrongCount);
+    }
+
+    /**
+     * @notice Slash original verifiers who voted wrong on an audited asset
+     * @dev Called for each asset where audit consensus differs from original
+     * @param originalBatchId The original batch
+     * @param assetId The asset that was decided incorrectly
+     * @param correctDecision The audit consensus (ground truth)
+     */
+    function _slashOriginalWrongVoters(
+        bytes32 originalBatchId,
+        uint64 assetId,
+        Decision correctDecision
+    ) internal {
+        address[] storage originalVoters = batchVoters[originalBatchId];
+
+        for (uint256 i = 0; i < originalVoters.length; i++) {
+            address voter = originalVoters[i];
+            Decision voterDecision = assetVotes[originalBatchId][assetId][voter].decision;
+
+            // Slash if they voted wrong (and actually voted)
+            if (voterDecision != correctDecision && voterDecision != Decision.NONE) {
+                Verifier storage v = verifiers[voter];
+
+                // Calculate slash amount (100% for audit failures - STAKESURE security model)
+                // @custom:security Full slashing ensures CoC > PoC for cryptoeconomic security
+                uint256 totalSlashable = v.stakedAmount + v.unbondingAmount;
+                uint256 slashAmount = (totalSlashable * SLASH_AUDIT_FAIL_BPS) / BPS;
+
+                // Slash from staked first, then unbonding
+                if (slashAmount <= v.stakedAmount) {
+                    v.stakedAmount -= slashAmount;
+                    totalStake -= slashAmount;
+                } else {
+                    uint256 fromStaked = v.stakedAmount;
+                    uint256 fromUnbonding = slashAmount - fromStaked;
+
+                    v.stakedAmount = 0;
+                    totalStake -= fromStaked;
+
+                    if (fromUnbonding <= v.unbondingAmount) {
+                        v.unbondingAmount -= fromUnbonding;
+                    } else {
+                        slashAmount = fromStaked + v.unbondingAmount;
+                        v.unbondingAmount = 0;
+                    }
+                }
+
+                slashingTreasury += slashAmount;
+                v.lastSlashTime = uint40(block.timestamp);
+
+                emit VerifierSlashed(voter, slashAmount, "audit");
+
+                // Deactivate if below minimum stake
+                if (v.stakedAmount < MIN_STAKE && v.isActive) {
+                    v.isActive = false;
+                    activeVerifierCount--;
+                    _removeFromActiveList(voter);
+                }
+            }
+        }
+    }
+
+    // NOTE: retryBatchSelection, forceFailBatch, challengeAudit, triggerAuditVoting and
+    // related helper functions moved to VerifierNetworkExt for contract size reduction.
+    // These are called via the fallback() delegatecall mechanism (CometExt pattern).
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VRF INTEGRATION (CHAINLINK V2.5)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Start a new epoch and request VRF randomness
+     * @dev Anyone can call this to start a new epoch
+     */
+    function startNewEpoch() external {
+        if (s_subscriptionId == 0) revert InvalidInput();
+
+        currentEpoch++;
+
+        uint256 requestId = s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: s_keyHash,
+                subId: s_subscriptionId,
+                requestConfirmations: s_requestConfirmations,
+                callbackGasLimit: s_callbackGasLimit,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(
+                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                )
+            })
+        );
+
+        epochs[currentEpoch] = Epoch({
+            vrfRequestId: requestId,
+            randomSeed: 0,
+            startTime: uint40(block.timestamp),
+            fulfilled: false
+        });
+
+        vrfRequestToEpoch[requestId] = currentEpoch;
+
+        emit EpochStarted(currentEpoch, requestId);
+    }
+
+    /**
+     * @notice VRF callback - called by Chainlink VRF Coordinator
+     * @dev Stores the random seed for per-batch verifier selection
+     *      AND performs retrospective audit on previous epoch's batches
+     *
+     * Security: Audit selection uses NEW seed to audit PREVIOUS epoch
+     *           This makes audits UNPREDICTABLE at voting time!
+     */
+    function fulfillRandomWords(
+        uint256 requestId,
+        uint256[] calldata randomWords
+    ) internal override {
+        uint256 epoch = vrfRequestToEpoch[requestId];
+        if (epoch == 0) return;
+
+        Epoch storage e = epochs[epoch];
+        e.randomSeed = randomWords[0];
+        e.fulfilled = true;
+
+        // RETROSPECTIVE AUDIT: Use this epoch's seed to audit PREVIOUS epoch's batches
+        // Verifiers couldn't predict this when they voted!
+        // Calls extension via fallback (delegatecall)
+        if (epoch > 1) {
+            // 0xadc50dd8 = bytes4(keccak256("auditPreviousEpochBatches(uint256,uint256)"))
+            (bool success, ) = address(this).call(
+                abi.encodeWithSelector(0xadc50dd8, epoch - 1, randomWords[0])
+            );
+            success; // Silence unused variable warning
+        }
+
+        emit EpochFulfilled(epoch, new address[](0)); // No pre-selection, done per-batch
+    }
+
+    // NOTE: _auditPreviousEpochBatches moved to VerifierNetworkExt
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL: JJSKIN EXECUTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Execute combined decisions on JJSKIN
+     * @dev Calls the new batchExecuteDecisions function for gas efficiency
+     */
+    function _executeDecisions(
+        uint64[] memory claimAssets,
+        uint64[] memory refundAssets,
+        IJJSKIN.RefundReason[] memory refundReasons
+    ) internal {
+        // Call combined function on JJSKIN
+        IJJSKIN(jjskin).batchExecuteDecisions(claimAssets, refundAssets, refundReasons);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL: MINORITY TRACKING & SLASHING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Check all voters' metrics after batch execution
+     * @dev Called once per batch to evaluate all participants
+     *      Note: Minority votes are tracked per-asset in _recordMinorityVotersForAsset
+     */
+    function _checkAllVoterMetrics(bytes32 batchId) internal {
+        address[] storage voters = batchVoters[batchId];
+        for (uint256 i = 0; i < voters.length; i++) {
+            _checkVerifierMetrics(voters[i]);
+        }
+    }
+
+    /**
+     * @notice Check verifier's dual-track metrics (minority + participation)
+     * @dev Called after each batch to evaluate verifier behavior
+     */
+    function _checkVerifierMetrics(address voter) internal {
+        Verifier storage v = verifiers[voter];
+
+        // Calculate rates
+        uint256 minorityRate = v.totalVotes > 0
+            ? (v.minorityVotes * BPS) / v.totalVotes
+            : 0;
+        uint256 participationRate = v.assignedBatches > 0
+            ? (v.totalVotes * BPS) / v.assignedBatches
+            : BPS; // 100% if no assignments yet
+
+        // ─────────────────────────────────────────────────────────────────
+        // SELECTIVE ABSTENTION DETECTION (most severe - check first)
+        // ─────────────────────────────────────────────────────────────────
+        if (v.assignedBatches >= MIN_ASSIGNMENTS_FOR_PARTICIPATION_ANALYSIS &&
+            minorityRate > SELECTIVE_ABSTENTION_MINORITY_BPS &&
+            participationRate < SELECTIVE_ABSTENTION_PARTICIPATION_BPS) {
+            // Strategic gaming detected - 10% slash
+            uint256 slashAmount = (v.stakedAmount * 1000) / BPS; // 10% = 1000/10000
+            _slashVerifier(voter, slashAmount, "abs");
+            emit SelectiveAbstentionDetected(voter, minorityRate, participationRate);
+            return;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // MINORITY RATE CHECKS (correctness)
+        // ─────────────────────────────────────────────────────────────────
+        if (v.totalVotes >= MIN_VOTES_FOR_MINORITY_ANALYSIS) {
+            if (minorityRate >= MINORITY_SLASH_BPS) {
+                // > 15% minority rate: SLASH 5%
+                uint256 slashAmount = (v.stakedAmount * SLASH_CAP_BPS) / BPS;
+                _slashVerifier(voter, slashAmount, "minority");
+            } else if (minorityRate >= MINORITY_SUSPEND_BPS) {
+                // > 10% minority rate: SUSPEND + SLASH 2%
+                uint256 slashAmount = (v.stakedAmount * 200) / BPS;
+                _slashVerifier(voter, slashAmount, "high");
+                _suspendVerifier(voter, "min>10");
+            } else if (minorityRate >= MINORITY_WARNING_BPS) {
+                // > 5% minority rate: WARNING
+                v.minorityWarnings++;
+                emit MinorityWarning(voter, minorityRate);
+                if (v.minorityWarnings >= 3) {
+                    _suspendVerifier(voter, "3 warns");
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // PARTICIPATION RATE CHECKS (reliability)
+        // ─────────────────────────────────────────────────────────────────
+        if (v.assignedBatches >= MIN_ASSIGNMENTS_FOR_PARTICIPATION_ANALYSIS) {
+            if (participationRate < PARTICIPATION_SLASH_BPS) {
+                // < 60% participation: SLASH 3%
+                uint256 slashAmount = (v.stakedAmount * 300) / BPS;
+                _slashVerifier(voter, slashAmount, "low part");
+            } else if (participationRate < PARTICIPATION_SUSPEND_BPS) {
+                // < 80% participation: SUSPEND
+                _suspendVerifier(voter, "part<80%");
+            } else if (participationRate < PARTICIPATION_WARNING_BPS) {
+                // < 90% participation: WARNING
+                v.participationWarnings++;
+                emit ParticipationWarning(voter, participationRate);
+                if (v.participationWarnings >= 3) {
+                    _suspendVerifier(voter, "3 part warns");
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Internal: slash a verifier's stake
+     */
+    function _slashVerifier(address voter, uint256 slashAmount, string memory reason) internal {
+        Verifier storage v = verifiers[voter];
+
+        if (slashAmount > v.stakedAmount) {
+            slashAmount = v.stakedAmount;
+        }
+
+        v.stakedAmount -= slashAmount;
+        totalStake -= slashAmount;
+        slashingTreasury += slashAmount;
+        v.lastSlashTime = uint40(block.timestamp);
+
+        emit VerifierSlashed(voter, slashAmount, reason);
+
+        // Deactivate if below minimum stake
+        if (v.stakedAmount < MIN_STAKE && v.isActive) {
+            v.isActive = false;
+            activeVerifierCount--;
+            _removeFromActiveList(voter);
+        }
+    }
+
+    /**
+     * @notice Internal: suspend a verifier
+     */
+    function _suspendVerifier(address voter, string memory reason) internal {
+        Verifier storage v = verifiers[voter];
+        if (v.isActive) {
+            v.isActive = false;
+            activeVerifierCount--;
+            _removeFromActiveList(voter);
+            emit VerifierSuspended(voter, reason);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL: REWARDS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Platform fee in BPS (must match JJSKIN.platformFeePercent)
+    /// @dev TODO: Consider reading from JJSKIN for dynamic updates
+    uint256 public constant PLATFORM_FEE_BPS = 50; // 0.5%
+
+    /**
+     * @notice Distribute rewards for a batch execution
+     * @dev Total pool = platform fees + creator deposit
+     *      Rewards split: 90% verifiers, 10% creator (if eligible)
+     *      Creator eligibility: platformFees >= MIN_BATCH_DEPOSIT (batch was profitable)
+     * @param batchId The executed batch
+     * @param claimCount Number of CLAIM decisions (fee-generating)
+     */
+    function _distributeRewards(bytes32 batchId, uint256 claimCount) internal {
+        Batch storage batch = batches[batchId];
+        uint64[] memory assetIds = batch.assetIds;
+
+        // Only claims generate fees
+        // Approximate: (claimCount / totalCount) * totalValue * platformFee
+        uint256 claimValue = assetIds.length > 0
+            ? (batch.totalValue * claimCount) / assetIds.length
+            : 0;
+
+        uint256 platformFees = (claimValue * PLATFORM_FEE_BPS) / BPS;
+        uint256 deposit = batch.creatorDeposit;
+
+        // Total pool for distribution
+        uint256 totalPool = platformFees + deposit;
+        if (totalPool == 0) return;
+
+        // Creator eligibility: batch generated more fees than deposit cost
+        uint256 creatorShare = 0;
+        uint256 verifierShare = 0;
+        bool isProfitable = (
+            batch.creator != address(0) &&
+            platformFees >= deposit
+        );
+
+        if (isProfitable) {
+            // Profitable: return full deposit + 10% of fees to creator
+            // Verifiers get 90% of fees
+            creatorShare = deposit + (platformFees * CREATOR_SHARE_BPS) / BPS;
+            verifierShare = platformFees - (platformFees * CREATOR_SHARE_BPS) / BPS;
+        } else {
+            // Unprofitable: deposit goes to verifiers as compensation
+            // Creator gets nothing, verifiers get fees + deposit
+            creatorShare = 0;
+            verifierShare = totalPool;
+        }
+
+        // Executor bonus: 5% of verifier pool (compensates gas cost for triggering execution)
+        // Executor is always a verifier who revealed, so they also get their equal share
+        uint256 executorBonus = (verifierShare * EXECUTOR_BONUS_BPS) / BPS;
+        uint256 remainingVerifierPool = verifierShare - executorBonus;
+        uint256 perVerifier = batch.revealCount > 0 ? remainingVerifierPool / batch.revealCount : 0;
+
+        // Distribute to all verifiers who revealed
+        address[] storage voters = batchVoters[batchId];
+        for (uint256 i = 0; i < voters.length; i++) {
+            verifiers[voters[i]].pendingRewards += perVerifier;
+        }
+
+        // Credit executor bonus (executor is always a verifier)
+        if (executorBonus > 0 && batch.executor != address(0)) {
+            verifiers[batch.executor].pendingRewards += executorBonus;
+        }
+
+        // Credit creator if eligible
+        if (creatorShare > 0) {
+            if (verifiers[batch.creator].isActive) {
+                verifiers[batch.creator].pendingRewards += creatorShare;
+            } else {
+                nonVerifierRewards[batch.creator] += creatorShare;
+            }
+        }
+
+        emit RewardsDistributed(batchId, totalPool);
+    }
+
+    /**
+     * @notice Claim accumulated rewards (for verifiers)
+     */
+    function claimRewards() external nonReentrant {
+        Verifier storage v = verifiers[msg.sender];
+        uint256 amount = v.pendingRewards;
+        if (amount == 0) revert InvalidInput();
+
+        v.pendingRewards = 0;
+        usdc.safeTransfer(msg.sender, amount);
+
+        emit RewardClaimed(msg.sender, amount);
+    }
+
+    /**
+     * @notice Claim creator rewards (for non-verifier batch creators)
+     * @dev Separate from claimRewards() because non-verifiers don't have Verifier struct
+     */
+    function claimCreatorRewards() external nonReentrant {
+        uint256 amount = nonVerifierRewards[msg.sender];
+        if (amount == 0) revert InvalidInput();
+
+        nonVerifierRewards[msg.sender] = 0;
+        usdc.safeTransfer(msg.sender, amount);
+
+        emit RewardClaimed(msg.sender, amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TREASURY MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Withdraw from slashing treasury (governance only)
+     * @param to Recipient address
+     * @param amount Amount to withdraw
+     */
+    function withdrawTreasury(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (amount > slashingTreasury) revert InsufficientTreasury();
+        if (to == address(0)) revert ZeroAddress();
+
+        slashingTreasury -= amount;
+        usdc.safeTransfer(to, amount);
+
+        emit TreasuryWithdraw(to, amount);
+    }
+
+    /**
+     * @notice Set treasury beneficiary
+     */
+    function setTreasuryBeneficiary(address _beneficiary) external onlyOwner {
+        if (_beneficiary == address(0)) revert ZeroAddress();
+        treasuryBeneficiary = _beneficiary;
+    }
+
+    /**
+     * @notice Update batch deposit amount
+     * @dev Adjustable based on gas costs. Can only be increased or decreased within bounds.
+     * @param _deposit New deposit amount in USDC (6 decimals)
+     */
+    function setBatchDeposit(uint256 _deposit) external onlyOwner {
+        // Minimum 0.01 USDC, maximum 1 USDC (reasonable bounds)
+        if (_deposit < 10000 || _deposit > 1000000) revert InvalidInput();
+        batchDeposit = _deposit;
+        emit BatchDepositUpdated(_deposit);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Configure VRF settings
+     * @param subscriptionId Chainlink VRF subscription ID
+     * @param keyHash VRF key hash (gas lane)
+     */
+    function setVRFConfig(
+        uint256 subscriptionId,
+        bytes32 keyHash
+    ) external onlyOwner {
+        s_subscriptionId = subscriptionId;
+        s_keyHash = keyHash;
+        emit VRFConfigUpdated(subscriptionId, keyHash);
+    }
+
+    /**
+     * @notice Set VRF callback gas limit
+     */
+    function setVRFCallbackGasLimit(uint32 gasLimit) external onlyOwner {
+        s_callbackGasLimit = gasLimit;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function getActiveVerifiers() external view returns (address[] memory) {
+        return activeVerifierList;
+    }
+
+    function getVerifier(address verifier) external view returns (
+        uint256 stakedAmount,
+        uint256 unbondingAmount,
+        uint256 pendingRewards,
+        uint256 minorityVotes,
+        uint256 totalVotes,
+        bool isActive
+    ) {
+        Verifier storage v = verifiers[verifier];
+        return (
+            v.stakedAmount,
+            v.unbondingAmount,
+            v.pendingRewards,
+            v.minorityVotes,
+            v.totalVotes,
+            v.isActive
+        );
+    }
+
+    function getVerifierTimestamps(address verifier) external view returns (
+        uint256 assignedBatches,
+        uint40 registeredAt,
+        uint40 unbondingStart
+    ) {
+        Verifier storage v = verifiers[verifier];
+        return (v.assignedBatches, v.registeredAt, v.unbondingStart);
+    }
+
+    /**
+     * @notice Get verifier performance metrics
+     * @return minorityRate Percentage of votes that were minority (BPS)
+     * @return participationRate Percentage of assignments where verifier voted (BPS)
+     * @return minorityWarnings Number of minority warnings received
+     * @return participationWarnings Number of participation warnings received
+     */
+    function getVerifierMetrics(address verifier) external view returns (
+        uint256 minorityRate,
+        uint256 participationRate,
+        uint8 minorityWarnings,
+        uint8 participationWarnings
+    ) {
+        Verifier storage v = verifiers[verifier];
+
+        minorityRate = v.totalVotes > 0
+            ? (v.minorityVotes * BPS) / v.totalVotes
+            : 0;
+
+        participationRate = v.assignedBatches > 0
+            ? (v.totalVotes * BPS) / v.assignedBatches
+            : BPS;
+
+        return (
+            minorityRate,
+            participationRate,
+            v.minorityWarnings,
+            v.participationWarnings
+        );
+    }
+
+    function getBatch(bytes32 batchId) external view returns (
+        bytes32 contentHash,
+        uint256 totalValue,
+        BatchState state,
+        uint8 revealCount,
+        uint8 retryCount,
+        uint40 createdAt,
+        uint40 executedAt,
+        address creator
+    ) {
+        Batch storage b = batches[batchId];
+        return (
+            keccak256(abi.encode(b.assetIds)),  // Compute on-the-fly (saves 1 storage slot)
+            b.totalValue,
+            b.state,
+            b.revealCount,
+            b.retryCount,
+            b.createdAt,
+            b.executedAt,
+            b.creator
+        );
+    }
+
+    /**
+     * @notice Get per-asset consensus results for a batch
+     * @param batchId The batch to query
+     * @param assetId The specific asset to check
+     * @return decision The consensus decision
+     * @return refundReason The refund reason (if REFUND)
+     * @return votesFor Number of votes for this decision
+     * @return hasConsensus Whether consensus was reached
+     */
+    function getAssetConsensus(bytes32 batchId, uint64 assetId) external view returns (
+        Decision decision,
+        RefundReason refundReason,
+        uint8 votesFor,
+        bool hasConsensus
+    ) {
+        AssetConsensus storage c = assetConsensus[batchId][assetId];
+        return (c.decision, c.refundReason, c.votesFor, c.hasConsensus);
+    }
+
+    /**
+     * @notice Get vote counts for all decision types for an asset
+     * @param batchId The batch to query
+     * @param assetId The specific asset to check
+     */
+    function getAssetVoteCounts(bytes32 batchId, uint64 assetId) external view returns (
+        uint8 claimVotes,
+        uint8 refundVotes,
+        uint8 invalidVotes
+    ) {
+        return (
+            assetVoteCounts[batchId][assetId][Decision.CLAIM],
+            assetVoteCounts[batchId][assetId][Decision.REFUND],
+            assetVoteCounts[batchId][assetId][Decision.INVALID]
+        );
+    }
+
+    function getBatchAssetIds(bytes32 batchId) external view returns (uint64[] memory) {
+        return batches[batchId].assetIds;
+    }
+
+    function getAudit(bytes32 batchId) external view returns (
+        bytes32 auditBatchId,
+        AuditState state,
+        uint40 challengeDeadline
+    ) {
+        Audit storage a = audits[batchId];
+        return (a.auditBatchId, a.state, a.challengeDeadline);
+    }
+
+    function getEpoch(uint256 epoch) external view returns (
+        uint256 vrfRequestId,
+        uint256 randomSeed,
+        uint40 startTime,
+        bool fulfilled
+    ) {
+        Epoch storage e = epochs[epoch];
+        return (e.vrfRequestId, e.randomSeed, e.startTime, e.fulfilled);
+    }
+
+    function getEpochVerifiers(uint256 epoch) external view returns (address[] memory) {
+        return epochVerifiers[epoch];
+    }
+
+    function getEpochBatches(uint256 epoch) external view returns (bytes32[] memory) {
+        return epochBatches[epoch];
+    }
+
+    function getBatchAssignedVerifiers(bytes32 batchId) external view returns (address[] memory) {
+        return batchAssignedVerifiers[batchId];
+    }
+
+    function getUnbondingStatus(address verifier) external view returns (
+        uint256 amount,
+        uint40 cooldownEnds,
+        uint40 claimWindowEnds,
+        bool canClaim,
+        bool expired
+    ) {
+        Verifier storage v = verifiers[verifier];
+        if (v.unbondingAmount == 0) {
+            return (0, 0, 0, false, false);
+        }
+
+        uint40 cooldownEnd = v.unbondingStart + uint40(UNBONDING_PERIOD);
+        uint40 claimEnd = cooldownEnd + uint40(CLAIM_WINDOW);
+
+        return (
+            v.unbondingAmount,
+            cooldownEnd,
+            claimEnd,
+            block.timestamp >= cooldownEnd && block.timestamp <= claimEnd,
+            block.timestamp > claimEnd
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ARWEAVE & SPAM PROTECTION VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Get Arweave block height for a batch
+     * @dev Verifiers use this to query proofs from Arweave with deterministic block limit
+     * @param batchId The batch to query
+     * @return Arweave block height (query proofs with block <= this)
+     */
+    function getBatchArweaveBlock(bytes32 batchId) external view returns (uint64) {
+        return batches[batchId].arweaveBlock;
+    }
+
+    /**
+     * @notice Get asset settlement status
+     * @param assetId The asset to query
+     * @return pendingBatchId Current pending batch (bytes32(0) if none)
+     * @return isSettled Whether the asset has been permanently settled
+     */
+    function getAssetStatus(uint64 assetId) external view returns (
+        bytes32 pendingBatchId,
+        bool isSettled
+    ) {
+        return (pendingAssets[assetId], settledAssets[assetId]);
+    }
+
+    // NOTE: checkBatchEligibility moved to VerifierNetworkExt
+}

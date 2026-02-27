@@ -1,0 +1,695 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IJJSKIN} from "../interfaces/IJJSKIN.sol";
+
+/**
+ * @title VerifierNetworkExt
+ * @notice Extension contract for VerifierNetwork (CometExt pattern)
+ * @dev Contains less-frequently-used functions to reduce main contract size
+ *      Called via delegatecall from main contract's fallback
+ *      Storage layout MUST match VerifierNetwork exactly
+ */
+contract VerifierNetworkExt {
+    using SafeERC20 for IERC20;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REENTRANCY GUARD (uses same storage slot as main contract)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_status != ENTERED, "ReentrancyGuard: reentrant call");
+        _status = ENTERED;
+        _;
+        _status = NOT_ENTERED;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STORAGE LAYOUT (MUST MATCH VerifierNetwork EXACTLY)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Inherited from ReentrancyGuard (slot 0)
+    uint256 private _status;
+
+    // Inherited from ConfirmedOwnerWithProposal via VRFConsumerBaseV2Plus (slots 1-2)
+    address private s_owner;
+    address private s_pendingOwner;
+
+    // Inherited from VRFConsumerBaseV2Plus (slot 3)
+    address private s_vrfCoordinator;
+
+    // From VerifierNetwork - TYPES
+    enum Decision { NONE, CLAIM, REFUND, INVALID }
+    enum RefundReason { None, FailedDelivery, TradeReversed, TradeDeclined, Expired }
+    enum BatchState { NONE, COMMIT_PHASE, REVEAL_PHASE, READY, EXECUTED }
+    enum AuditState { NONE, PENDING, VOTING, RESOLVED }
+
+    struct AssetDecision {
+        uint64 assetId;
+        Decision decision;
+        RefundReason refundReason;
+    }
+
+    struct Verifier {
+        uint256 stakedAmount;
+        uint256 unbondingAmount;
+        uint256 pendingRewards;
+        uint256 minorityVotes;
+        uint256 totalVotes;
+        uint256 assignedBatches;
+        uint40 registeredAt;
+        uint40 lastSlashTime;
+        uint40 unbondingStart;
+        uint8 minorityWarnings;
+        uint8 participationWarnings;
+        bool isActive;
+    }
+
+    struct Batch {
+        uint64[] assetIds;
+        uint128 totalValue;
+        uint128 creatorDeposit;
+        uint40 commitDeadline;
+        uint40 revealDeadline;
+        uint40 executedAt;
+        uint40 createdAt;
+        BatchState state;
+        uint8 revealCount;
+        uint8 retryCount;
+        bool isAuditBatch;
+        address creator;
+        uint64 arweaveBlock;
+        address executor;
+    }
+
+    struct AuditBatchMeta {
+        bytes32 originalBatchId;
+        address challenger;
+    }
+
+    struct AssetConsensus {
+        Decision decision;
+        RefundReason refundReason;
+        uint8 votesFor;
+        bool hasConsensus;
+    }
+
+    struct Audit {
+        bytes32 auditBatchId;
+        AuditState state;
+        uint40 challengeDeadline;
+    }
+
+    struct Epoch {
+        uint256 vrfRequestId;
+        uint256 randomSeed;
+        uint40 startTime;
+        bool fulfilled;
+    }
+
+    // CONSTANTS (must match)
+    uint256 public constant MIN_STAKE = 1000e6;
+    uint256 public constant MIN_ORACLE_COUNT = 4;
+    uint256 public constant CONCENTRATION_ENFORCEMENT_MIN = 10;
+    uint256 public constant MIN_COMMITTEE_SIZE = 4;
+    uint256 public constant MAX_COMMITTEE_SIZE = 64;
+    uint256 public constant COMMITTEE_VALUE_UNIT = 100e6;
+    uint256 public constant COMMIT_WINDOW = 30 minutes;
+    uint256 public constant REVEAL_WINDOW = 15 minutes;
+    uint256 public constant MAX_STAKE_SHARE_BPS = 1000;
+    uint256 public constant MINORITY_WARNING_BPS = 500;
+    uint256 public constant MINORITY_SUSPEND_BPS = 1000;
+    uint256 public constant MINORITY_SLASH_BPS = 1500;
+    uint256 public constant MIN_VOTES_FOR_MINORITY_ANALYSIS = 20;
+    uint256 public constant PARTICIPATION_WARNING_BPS = 9000;
+    uint256 public constant PARTICIPATION_SUSPEND_BPS = 8000;
+    uint256 public constant PARTICIPATION_SLASH_BPS = 6000;
+    uint256 public constant MIN_ASSIGNMENTS_FOR_PARTICIPATION_ANALYSIS = 30;
+    uint256 public constant SELECTIVE_ABSTENTION_MINORITY_BPS = 1000;
+    uint256 public constant SELECTIVE_ABSTENTION_PARTICIPATION_BPS = 7000;
+    uint256 public constant OVER_SELECTION_BUFFER = 2;
+    uint256 public constant LOG_COEFFICIENT = 6;
+    uint256 public constant MAX_BATCH_RETRIES = 2;
+    uint256 public constant BATCH_FAILURE_TIMEOUT = 24 hours;
+    uint256 public constant VERIFIER_SHARE_BPS = 9000;
+    uint256 public constant CREATOR_SHARE_BPS = 1000;
+    uint256 public constant EXECUTOR_BONUS_BPS = 500;
+    uint256 public constant UNBONDING_PERIOD = 28 days;
+    uint256 public constant CLAIM_WINDOW = 7 days;
+    uint256 public constant AUDIT_CHALLENGE_WINDOW = 2 hours;
+    uint256 public constant AUDIT_RESOLUTION_DEADLINE = 72 hours;
+    uint256 public constant AUDIT_BOND_BPS = 500;
+    uint256 public constant MIN_AUDIT_BOND = 100e6;
+    uint256 public constant AUDIT_SAMPLE_RATE_BPS = 100;
+    uint256 public constant SLASH_MINORITY_BPS = 500;
+    uint256 public constant SLASH_AUDIT_FAIL_BPS = 10000;
+    uint256 public constant SLASH_CAP_BPS = SLASH_MINORITY_BPS;
+    uint256 private constant BPS = 10000;
+    uint256 public constant DEFAULT_BATCH_DEPOSIT = 50000;
+    uint256 public constant MAX_BATCH_SIZE = 200;
+    uint256 public constant PLATFORM_FEE_BPS = 100;
+
+    // IMMUTABLES - stored as regular storage in extension (matched by delegatecall)
+    IERC20 public immutable usdc;
+    address public immutable jjskin;
+
+    // VRF CONFIG
+    uint256 public s_subscriptionId;
+    bytes32 public s_keyHash;
+    uint32 public s_callbackGasLimit;
+    uint16 public s_requestConfirmations;
+
+    // STATE
+    uint256 public totalStake;
+    uint256 public activeVerifierCount;
+    uint256 public currentEpoch;
+    uint256 public slashingTreasury;
+    address public treasuryBeneficiary;
+    uint256 public batchDeposit;
+
+    mapping(address => Verifier) public verifiers;
+    address[] public activeVerifierList;
+    mapping(address => uint256) private verifierIndex;
+    mapping(bytes32 => Batch) public batches;
+    mapping(bytes32 => AuditBatchMeta) public auditBatchMeta;
+    mapping(bytes32 => mapping(address => bytes32)) public commits;
+    mapping(bytes32 => mapping(address => bool)) public hasRevealed;
+    mapping(bytes32 => address[]) public batchVoters;
+    mapping(bytes32 => mapping(uint64 => mapping(address => AssetDecision))) public assetVotes;
+    mapping(bytes32 => mapping(uint64 => mapping(Decision => uint8))) public assetVoteCounts;
+    mapping(bytes32 => mapping(uint64 => mapping(RefundReason => uint8))) public assetRefundReasonCounts;
+    mapping(bytes32 => mapping(uint64 => AssetConsensus)) public assetConsensus;
+    mapping(uint256 => Epoch) public epochs;
+    mapping(uint256 => address[]) public epochVerifiers;
+    mapping(uint256 => bytes32[]) public epochBatches;
+    mapping(uint256 => uint256) public vrfRequestToEpoch;
+    mapping(bytes32 => Audit) public audits;
+    mapping(bytes32 => address[]) public batchAssignedVerifiers;
+    mapping(bytes32 => mapping(address => bool)) public batchVerifierAssigned;
+    mapping(bytes32 => mapping(address => bool)) public batchNonResponders;
+    mapping(uint64 => bytes32) public pendingAssets;
+    mapping(uint64 => bool) public settledAssets;
+    mapping(address => uint256) public nonVerifierRewards;
+
+    // ERRORS
+    error InvalidBatchState(BatchState current, BatchState expected);
+    error AuditWindowClosed();
+    error InsufficientBond(uint256 provided, uint256 required);
+    error InvalidInput();
+    error InvalidAssetId(uint64 assetId);
+    error MaxRetriesExceeded();
+    error RetryNotNeeded();
+    error BatchTimedOut();
+    error NotEnoughVerifiers(uint256 current, uint256 required);
+    error VRFNotReady();
+
+    // EVENTS
+    event AuditChallenged(bytes32 indexed batchId, address indexed challenger, uint256 bond, Decision claimedTruth);
+    event BatchRetried(bytes32 indexed batchId, uint8 retryCount, address[] newVerifiers);
+    event BatchFailed(bytes32 indexed batchId, string reason);
+    event VerifierNonResponse(address indexed verifier, bytes32 indexed batchId);
+    event BatchSettled(bytes32 indexed batchId, Decision decision, uint64[] assetIds);
+    event AuditSelected(bytes32 indexed batchId);
+
+    /// @notice Constructor sets immutable addresses (must match main contract)
+    /// @dev Storage layout matching is for delegatecall; immutables are in bytecode
+    constructor(address _usdc, address _jjskin) {
+        usdc = IERC20(_usdc);
+        jjskin = _jjskin;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXTENSION FUNCTIONS (called via delegatecall)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Challenge a specific asset's decision with bond
+     * @dev Anyone can challenge within AUDIT_CHALLENGE_WINDOW of execution
+     *      Creates an audit batch with just the challenged asset for re-voting
+     *      New verifiers (excluding original voters) determine the truth
+     * @param originalBatchId The batch containing the asset
+     * @param assetId The specific asset being challenged
+     */
+    function challengeAudit(
+        bytes32 originalBatchId,
+        uint64 assetId
+    ) external nonReentrant {
+        Batch storage batch = batches[originalBatchId];
+        if (batch.state != BatchState.EXECUTED) {
+            revert InvalidBatchState(batch.state, BatchState.EXECUTED);
+        }
+
+        Audit storage audit = audits[originalBatchId];
+
+        // Can challenge if:
+        // 1. Selected for audit and within pending window (reduced/no bond since already flagged)
+        // 2. OR anyone can challenge within AUDIT_CHALLENGE_WINDOW of execution
+        bool canChallenge = (
+            (audit.state == AuditState.PENDING && block.timestamp <= audit.challengeDeadline) ||
+            (audit.state == AuditState.NONE && block.timestamp <= batch.executedAt + AUDIT_CHALLENGE_WINDOW)
+        );
+
+        if (!canChallenge) revert AuditWindowClosed();
+        if (audit.state == AuditState.VOTING || audit.state == AuditState.RESOLVED) {
+            revert InvalidInput(); // Already being audited or resolved
+        }
+
+        // Verify assetId is in the batch
+        bool assetFound = false;
+        for (uint256 i = 0; i < batch.assetIds.length; i++) {
+            if (batch.assetIds[i] == assetId) {
+                assetFound = true;
+                break;
+            }
+        }
+        if (!assetFound) revert InvalidAssetId(assetId);
+
+        // Calculate and collect bond
+        uint256 bond = (batch.totalValue * AUDIT_BOND_BPS) / BPS;
+        if (bond < MIN_AUDIT_BOND) bond = MIN_AUDIT_BOND;
+
+        usdc.safeTransferFrom(msg.sender, address(this), bond);
+
+        // Create audit batch with just this asset
+        uint64[] memory challengedAssets = new uint64[](1);
+        challengedAssets[0] = assetId;
+
+        bytes32 auditBatchId = _createAuditBatch(
+            originalBatchId,
+            challengedAssets,
+            msg.sender,  // Challenger
+            bond         // Bond stored in audit batch
+        );
+
+        // Update audit state
+        audit.auditBatchId = auditBatchId;
+        audit.state = AuditState.VOTING;
+        audit.challengeDeadline = uint40(block.timestamp);  // Challenge window closed
+
+        emit AuditChallenged(originalBatchId, msg.sender, bond, Decision.NONE);
+    }
+
+    /**
+     * @notice Retry batch with replacement verifiers
+     */
+    function retryBatchSelection(bytes32 batchId) external nonReentrant {
+        Batch storage batch = batches[batchId];
+
+        if (batch.state == BatchState.REVEAL_PHASE && block.timestamp > batch.revealDeadline) {
+            batch.state = BatchState.READY;
+        }
+        if (batch.state != BatchState.READY) {
+            revert InvalidBatchState(batch.state, BatchState.READY);
+        }
+
+        uint256 threshold = _getThreshold();
+        bool allHaveConsensus = _checkAllAssetsHaveConsensus(batchId, threshold);
+        if (allHaveConsensus) revert RetryNotNeeded();
+
+        if (batch.retryCount >= MAX_BATCH_RETRIES) revert MaxRetriesExceeded();
+
+        if (block.timestamp > batch.createdAt + BATCH_FAILURE_TIMEOUT) {
+            _handleBatchFailure(batchId);
+            return;
+        }
+
+        _recordNonResponders(batchId);
+        _selectReplacementVerifiers(batchId);
+
+        batch.commitDeadline = uint40(block.timestamp + COMMIT_WINDOW);
+        batch.revealDeadline = uint40(block.timestamp + COMMIT_WINDOW + REVEAL_WINDOW);
+        batch.state = BatchState.COMMIT_PHASE;
+        batch.retryCount++;
+
+        emit BatchRetried(batchId, batch.retryCount, batchAssignedVerifiers[batchId]);
+    }
+
+    /**
+     * @notice Force fail a timed-out batch
+     */
+    function forceFailBatch(bytes32 batchId) external nonReentrant {
+        Batch storage batch = batches[batchId];
+
+        if (batch.state == BatchState.EXECUTED) {
+            revert InvalidBatchState(batch.state, BatchState.READY);
+        }
+        if (block.timestamp <= batch.createdAt + BATCH_FAILURE_TIMEOUT) {
+            revert BatchTimedOut();
+        }
+
+        _handleBatchFailure(batchId);
+    }
+
+    /**
+     * @notice Trigger audit voting for randomly selected batch
+     */
+    function triggerAuditVoting(bytes32 originalBatchId) external nonReentrant {
+        Audit storage audit = audits[originalBatchId];
+
+        if (audit.state != AuditState.PENDING) revert InvalidInput();
+        if (block.timestamp > audit.challengeDeadline) revert AuditWindowClosed();
+
+        bytes32 auditBatchId = _createAuditBatch(
+            originalBatchId,
+            batches[originalBatchId].assetIds,
+            address(0),
+            0
+        );
+
+        audit.auditBatchId = auditBatchId;
+        audit.state = AuditState.VOTING;
+    }
+
+    /**
+     * @notice Retrospectively audit batches from a previous epoch
+     * @dev Called when new epoch VRF is fulfilled - uses new seed for unpredictability
+     *      Selected batches are marked PENDING - anyone can trigger audit voting within window
+     * @param epochToAudit The epoch whose batches should be audited
+     * @param auditSeed The VRF seed from the NEXT epoch (unknown at voting time)
+     */
+    function auditPreviousEpochBatches(uint256 epochToAudit, uint256 auditSeed) external {
+        bytes32[] storage batchesToAudit = epochBatches[epochToAudit];
+
+        for (uint256 i = 0; i < batchesToAudit.length; i++) {
+            bytes32 batchId = batchesToAudit[i];
+
+            // Only audit executed batches (not failed/pending)
+            if (batches[batchId].state != BatchState.EXECUTED) continue;
+
+            // Already has an audit (e.g., from challenge)
+            if (audits[batchId].state != AuditState.NONE) continue;
+
+            // Random selection using FUTURE seed (unpredictable at vote time!)
+            uint256 roll = uint256(keccak256(abi.encode(auditSeed, batchId))) % BPS;
+
+            if (roll < AUDIT_SAMPLE_RATE_BPS) {
+                // Mark as pending - anyone can trigger audit voting within window
+                audits[batchId] = Audit({
+                    auditBatchId: bytes32(0),  // Set when audit batch is created
+                    state: AuditState.PENDING,
+                    challengeDeadline: uint40(block.timestamp + AUDIT_CHALLENGE_WINDOW)
+                });
+
+                emit AuditSelected(batchId);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _getThreshold() internal view returns (uint256) {
+        uint256 n = activeVerifierCount;
+        if (n < MIN_ORACLE_COUNT) revert NotEnoughVerifiers(n, MIN_ORACLE_COUNT);
+        return (2 * n + 3) / 3;
+    }
+
+    function _checkAllAssetsHaveConsensus(bytes32 batchId, uint256 threshold) internal view returns (bool) {
+        uint64[] memory assetIds = batches[batchId].assetIds;
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            if (!assetConsensus[batchId][assetIds[i]].hasConsensus) {
+                uint64 assetId = assetIds[i];
+                uint8 claimVotes = assetVoteCounts[batchId][assetId][Decision.CLAIM];
+                uint8 refundVotes = assetVoteCounts[batchId][assetId][Decision.REFUND];
+                uint8 invalidVotes = assetVoteCounts[batchId][assetId][Decision.INVALID];
+                if (claimVotes < threshold && refundVotes < threshold && invalidVotes < threshold) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    function _recordNonResponders(bytes32 batchId) internal {
+        address[] storage assigned = batchAssignedVerifiers[batchId];
+        for (uint256 i = 0; i < assigned.length; i++) {
+            address verifier = assigned[i];
+            if (!hasRevealed[batchId][verifier] && !batchNonResponders[batchId][verifier]) {
+                batchNonResponders[batchId][verifier] = true;
+                emit VerifierNonResponse(verifier, batchId);
+            }
+        }
+    }
+
+    function _selectReplacementVerifiers(bytes32 batchId) internal {
+        Batch storage batch = batches[batchId];
+        uint256 seed = epochs[currentEpoch].randomSeed;
+        if (seed == 0) return;
+
+        uint256 n = activeVerifierList.length;
+        uint256 threshold = _getThreshold();
+        uint256 selectCount = threshold + OVER_SELECTION_BUFFER;
+
+        uint256 currentResponders = 0;
+        address[] storage currentAssigned = batchAssignedVerifiers[batchId];
+        for (uint256 i = 0; i < currentAssigned.length; i++) {
+            if (hasRevealed[batchId][currentAssigned[i]]) {
+                currentResponders++;
+            }
+        }
+
+        uint256 needed = selectCount > currentResponders ? selectCount - currentResponders : 0;
+        if (needed == 0) return;
+
+        address[] memory eligible = new address[](n);
+        uint256 eligibleCount = 0;
+
+        for (uint256 i = 0; i < n; i++) {
+            address v = activeVerifierList[i];
+            if (!batchVerifierAssigned[batchId][v] && verifiers[v].isActive) {
+                eligible[eligibleCount] = v;
+                eligibleCount++;
+            }
+        }
+
+        uint256 toSelect = needed < eligibleCount ? needed : eligibleCount;
+
+        for (uint256 i = 0; i < toSelect; i++) {
+            uint256 j = i + (uint256(keccak256(abi.encode(seed, batchId, batch.retryCount, i))) % (eligibleCount - i));
+            (eligible[i], eligible[j]) = (eligible[j], eligible[i]);
+
+            address selected = eligible[i];
+            batchAssignedVerifiers[batchId].push(selected);
+            batchVerifierAssigned[batchId][selected] = true;
+            verifiers[selected].assignedBatches++;
+        }
+    }
+
+    function _handleBatchFailure(bytes32 batchId) internal {
+        Batch storage batch = batches[batchId];
+        batch.state = BatchState.EXECUTED;
+        batch.executedAt = uint40(block.timestamp);
+
+        uint64[] memory assetIds = batch.assetIds;
+
+        uint64[] memory refundAssets = new uint64[](assetIds.length);
+        IJJSKIN.RefundReason[] memory refundReasons = new IJJSKIN.RefundReason[](assetIds.length);
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            refundAssets[i] = assetIds[i];
+            refundReasons[i] = IJJSKIN.RefundReason.Expired;
+            settledAssets[assetIds[i]] = true;
+            pendingAssets[assetIds[i]] = bytes32(0);
+        }
+
+        uint64[] memory emptyClaimArray = new uint64[](0);
+        IJJSKIN(jjskin).batchExecuteDecisions(emptyClaimArray, refundAssets, refundReasons);
+
+        emit BatchSettled(batchId, Decision.REFUND, assetIds);
+        emit BatchFailed(batchId, "Max retries exceeded or timeout");
+    }
+
+    function _createAuditBatch(
+        bytes32 originalBatchId,
+        uint64[] memory assetIds,
+        address challenger,
+        uint256 bond
+    ) internal returns (bytes32 auditBatchId) {
+        Batch storage original = batches[originalBatchId];
+
+        // Generate unique audit batch ID (must match original hash logic)
+        auditBatchId = keccak256(abi.encode(
+            "AUDIT",
+            originalBatchId,
+            assetIds,
+            block.timestamp,
+            challenger
+        ));
+
+        // Create audit batch
+        Batch storage auditBatch = batches[auditBatchId];
+        auditBatch.assetIds = assetIds;
+        auditBatch.totalValue = original.totalValue;
+        auditBatch.creatorDeposit = uint128(bond);  // Reuse field for challenger bond
+        auditBatch.commitDeadline = uint40(block.timestamp + COMMIT_WINDOW);
+        auditBatch.revealDeadline = uint40(block.timestamp + COMMIT_WINDOW + REVEAL_WINDOW);
+        auditBatch.createdAt = uint40(block.timestamp);
+        auditBatch.state = BatchState.COMMIT_PHASE;
+        auditBatch.isAuditBatch = true;
+        auditBatch.creator = msg.sender;  // Who triggered the audit
+
+        // Store audit-specific metadata in separate mapping (reduces Batch struct size)
+        auditBatchMeta[auditBatchId] = AuditBatchMeta({
+            originalBatchId: originalBatchId,
+            challenger: challenger
+        });
+
+        // Select verifiers EXCLUDING original voters
+        _selectVerifiersExcludingOriginal(auditBatchId, originalBatchId);
+
+        return auditBatchId;
+    }
+
+    /**
+     * @notice Select verifiers for audit batch with adaptive committee sizing
+     * @dev Industry standard: adaptive thresholds based on network size (like EigenLayer)
+     *
+     * Network Size Handling:
+     * - n < 4: Cannot operate (MIN_ORACLE_COUNT not met for any batch)
+     * - 4 ≤ n ≤ 8: "Bootstrap mode" - use ALL active verifiers for audit
+     *   (overlap with original voters is allowed, but requires 90% consensus to override)
+     * - n > 8: Standard mode - prefer fresh verifiers, minimum 2 required
+     *
+     * This allows:
+     * - Small testnet deployments to function
+     * - Gradual network growth without breaking audits
+     * - Full security at scale (fresh committee requirement)
+     */
+    function _selectVerifiersExcludingOriginal(bytes32 auditBatchId, bytes32 originalBatchId) internal {
+        uint256 seed = epochs[currentEpoch].randomSeed;
+        if (seed == 0) revert VRFNotReady();
+
+        uint256 n = activeVerifierList.length;
+
+        // BOOTSTRAP MODE: For small networks (≤8 verifiers), use ALL verifiers
+        // This allows audits to work during network growth phase
+        // The resolution logic will require higher consensus (90%) for overlapping audits
+        if (n <= 8) {
+            _selectAllVerifiersForAudit(auditBatchId, seed);
+            return;
+        }
+
+        // STANDARD MODE: Prefer fresh verifiers (didn't vote on original)
+        address[] memory eligible = new address[](n);
+        uint256 eligibleCount = 0;
+
+        for (uint256 i = 0; i < n; i++) {
+            address v = activeVerifierList[i];
+            if (!hasRevealed[originalBatchId][v] && verifiers[v].isActive) {
+                eligible[eligibleCount] = v;
+                eligibleCount++;
+            }
+        }
+
+        // For large networks, require at least 2 fresh verifiers
+        // If not enough, fall back to bootstrap mode (all verifiers)
+        uint256 minFreshVerifiers = 2;
+        if (eligibleCount < minFreshVerifiers) {
+            _selectAllVerifiersForAudit(auditBatchId, seed);
+            return;
+        }
+
+        // Select up to MIN_ORACLE_COUNT + buffer from fresh verifiers
+        uint256 selectCount = MIN_ORACLE_COUNT + OVER_SELECTION_BUFFER;
+        if (selectCount > eligibleCount) selectCount = eligibleCount;
+
+        // Fisher-Yates shuffle for random selection
+        for (uint256 i = 0; i < selectCount; i++) {
+            uint256 j = i + (uint256(keccak256(abi.encode(seed, auditBatchId, i))) % (eligibleCount - i));
+            (eligible[i], eligible[j]) = (eligible[j], eligible[i]);
+
+            address selected = eligible[i];
+            batchAssignedVerifiers[auditBatchId].push(selected);
+            batchVerifierAssigned[auditBatchId][selected] = true;
+            verifiers[selected].assignedBatches++;
+        }
+    }
+
+    /**
+     * @notice Select ALL active verifiers for audit (bootstrap/fallback mode)
+     * @dev Used when network is too small for fresh committee requirement
+     */
+    function _selectAllVerifiersForAudit(bytes32 auditBatchId, uint256 seed) internal {
+        uint256 n = activeVerifierList.length;
+        if (n == 0) revert NotEnoughVerifiers(0, 1);
+
+        // Create shuffled copy for random order (fairer gas distribution)
+        address[] memory shuffled = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            shuffled[i] = activeVerifierList[i];
+        }
+
+        // Shuffle
+        for (uint256 i = 0; i < n; i++) {
+            uint256 j = i + (uint256(keccak256(abi.encode(seed, auditBatchId, "all", i))) % (n - i));
+            (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+        }
+
+        // Assign all
+        for (uint256 i = 0; i < n; i++) {
+            address selected = shuffled[i];
+            if (verifiers[selected].isActive) {
+                batchAssignedVerifiers[auditBatchId].push(selected);
+                batchVerifierAssigned[auditBatchId][selected] = true;
+                verifiers[selected].assignedBatches++;
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS (moved from main contract to save bytecode)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Batch check multiple assets for submission eligibility
+     * @dev Useful for JJSKIN bot to validate before creating batch
+     * @param assetIds Array of asset IDs to check
+     * @return eligible Array of booleans (true = can be included in batch)
+     * @return reasons Array of reason codes (0=eligible, 1=settled, 2=pending, 3=not_active)
+     */
+    function checkBatchEligibility(uint64[] calldata assetIds) external view returns (
+        bool[] memory eligible,
+        uint8[] memory reasons
+    ) {
+        eligible = new bool[](assetIds.length);
+        reasons = new uint8[](assetIds.length);
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+
+            // Check if already settled
+            if (settledAssets[assetId]) {
+                eligible[i] = false;
+                reasons[i] = 1; // settled
+                continue;
+            }
+
+            // Check if in pending batch
+            if (pendingAssets[assetId] != bytes32(0)) {
+                eligible[i] = false;
+                reasons[i] = 2; // pending
+                continue;
+            }
+
+            // Check JJSKIN state
+            try IJJSKIN(jjskin).getPurchaseStatus(assetId) returns (IJJSKIN.PurchaseStatus status) {
+                if (status == IJJSKIN.PurchaseStatus.Active) {
+                    eligible[i] = true;
+                    reasons[i] = 0; // eligible
+                } else {
+                    eligible[i] = false;
+                    reasons[i] = 3; // not_active
+                }
+            } catch {
+                eligible[i] = false;
+                reasons[i] = 3; // not_active (no purchase exists)
+            }
+        }
+    }
+}

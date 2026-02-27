@@ -1,0 +1,46 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.33"
+evm_version = "cancun"  # Required for EIP-1153 transient storage (ReentrancyGuardTransient)
+optimizer = true
+optimizer_runs = 1  # Optimize for size (VerifierNetwork exceeds 24KB at 200)
+via_ir = true
+remappings = [
+    "risc0/=lib/risc0-ethereum/contracts/src/"
+]
+
+[profile.production]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.33"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+[rpc_endpoints]
+mainnet = "https://eth.llamarpc.com"
+arbitrum = "https://arb1.arbitrum.io/rpc"
+arbitrum-sepolia = "https://sepolia-rollup.arbitrum.io/rpc"
+base = "https://mainnet.base.org"
+sepolia = "https://ethereum-sepolia-rpc.publicnode.com"
+
+[etherscan]
+mainnet = { key = "{ETHERSCAN_API_KEY}" }
+arbitrum = { key = "{ARBISCAN_API_KEY}" }
+arbitrum-sepolia = { key = "{ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api" }
+base = { key = "{BASESCAN_API_KEY}" }
+sepolia = { key = "{ETHERSCAN_API_KEY}" }
+
+[fuzz]
+runs = 512
+max_test_rejects = 65536
+seed = "0xdeadbeef"
+
+[invariant]
+runs = 64
+depth = 128
+fail_on_revert = false
+dictionary_weight = 80

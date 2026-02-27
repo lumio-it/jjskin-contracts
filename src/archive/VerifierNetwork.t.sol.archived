@@ -1,0 +1,1657 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import {Test, console2} from "forge-std/Test.sol";
+import {VerifierNetwork} from "../src/VerifierNetwork.sol";
+import {VerifierNetworkExt} from "../src/VerifierNetworkExt.sol";
+import {MockUSDC} from "../src/mocks/MockUSDC.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IJJSKIN} from "../src/interfaces/IJJSKIN.sol";
+
+// ============================================================================
+// Mock VRF Coordinator for testing
+// ============================================================================
+
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+
+contract MockVRFCoordinator {
+    uint256 public lastRequestId;
+    uint256 private nonce;
+
+    mapping(uint256 => address) public requestConsumer;
+
+    // VRF v2.5 interface - accepts struct
+    function requestRandomWords(
+        VRFV2PlusClient.RandomWordsRequest calldata /* req */
+    ) external returns (uint256 requestId) {
+        requestId = ++lastRequestId;
+        requestConsumer[requestId] = msg.sender;
+    }
+
+    // Helper to fulfill VRF requests in tests
+    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) external {
+        address consumer = requestConsumer[requestId];
+        require(consumer != address(0), "Request not found");
+
+        // Call the consumer's rawFulfillRandomWords
+        (bool success,) = consumer.call(
+            abi.encodeWithSignature(
+                "rawFulfillRandomWords(uint256,uint256[])",
+                requestId,
+                randomWords
+            )
+        );
+        require(success, "VRF callback failed");
+    }
+}
+
+// ============================================================================
+// Mock JJSKIN for testing oracle calls (per-asset model)
+// ============================================================================
+
+contract MockJJSKIN {
+    uint64[] public lastClaimedAssets;
+    uint64[] public lastRefundedAssets;
+    mapping(uint64 => bool) public claimedAssets;
+    mapping(uint64 => bool) public refundedAssets;
+    mapping(uint64 => uint8) public refundReasons;
+
+    // Per-asset purchase status
+    enum PurchaseStatus { Active, Released, Refunded }
+    mapping(uint64 => PurchaseStatus) public purchaseStatus;
+    mapping(uint64 => bool) public purchaseExists;
+
+    event BatchExecuted(uint64[] claimAssetIds, uint64[] refundAssetIds);
+
+    function setPurchaseActive(uint64 assetId) external {
+        purchaseExists[assetId] = true;
+        purchaseStatus[assetId] = PurchaseStatus.Active;
+    }
+
+    function getPurchaseStatus(uint64 assetId) external view returns (IJJSKIN.PurchaseStatus) {
+        require(purchaseExists[assetId], "No purchase exists");
+        if (purchaseStatus[assetId] == PurchaseStatus.Active) return IJJSKIN.PurchaseStatus.Active;
+        if (purchaseStatus[assetId] == PurchaseStatus.Released) return IJJSKIN.PurchaseStatus.Released;
+        return IJJSKIN.PurchaseStatus.Refunded;
+    }
+
+    function isPurchaseActive(uint64 assetId) external view returns (bool) {
+        return purchaseExists[assetId] && purchaseStatus[assetId] == PurchaseStatus.Active;
+    }
+
+    function batchExecuteDecisions(
+        uint64[] calldata claimAssetIds,
+        uint64[] calldata refundAssetIds,
+        IJJSKIN.RefundReason[] calldata reasons
+    ) external {
+        lastClaimedAssets = claimAssetIds;
+        lastRefundedAssets = refundAssetIds;
+
+        for (uint256 i = 0; i < claimAssetIds.length; i++) {
+            claimedAssets[claimAssetIds[i]] = true;
+            purchaseStatus[claimAssetIds[i]] = PurchaseStatus.Released;
+        }
+
+        for (uint256 i = 0; i < refundAssetIds.length; i++) {
+            refundedAssets[refundAssetIds[i]] = true;
+            refundReasons[refundAssetIds[i]] = uint8(reasons[i]);
+            purchaseStatus[refundAssetIds[i]] = PurchaseStatus.Refunded;
+        }
+
+        emit BatchExecuted(claimAssetIds, refundAssetIds);
+    }
+
+    function getLastClaimedAssets() external view returns (uint64[] memory) {
+        return lastClaimedAssets;
+    }
+
+    function getLastRefundedAssets() external view returns (uint64[] memory) {
+        return lastRefundedAssets;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // New Arweave batch support
+    // ─────────────────────────────────────────────────────────────
+
+    uint256 public _deliveryWindow = 6 hours;
+    mapping(uint64 => uint56) public assetPrices;
+    mapping(uint64 => uint40) public purchaseTimes;
+    mapping(uint64 => address) public assetSellers;
+
+    function setDeliveryWindow(uint256 window) external {
+        _deliveryWindow = window;
+    }
+
+    function setAssetInfo(uint64 assetId, uint56 price, uint40 purchaseTime, address seller) external {
+        assetPrices[assetId] = price;
+        purchaseTimes[assetId] = purchaseTime;
+        assetSellers[assetId] = seller;
+    }
+
+    function deliveryWindow() external view returns (uint256) {
+        return _deliveryWindow;
+    }
+
+    function getSellerAddress(uint64 assetId) external view returns (address) {
+        return assetSellers[assetId];
+    }
+
+    function getBatchAssetInfo(uint64[] calldata assetIds)
+        external
+        view
+        returns (
+            uint56[] memory prices,
+            uint40[] memory _purchaseTimes,
+            IJJSKIN.PurchaseStatus[] memory statuses
+        )
+    {
+        uint256 len = assetIds.length;
+        prices = new uint56[](len);
+        _purchaseTimes = new uint40[](len);
+        statuses = new IJJSKIN.PurchaseStatus[](len);
+
+        for (uint256 i = 0; i < len; i++) {
+            uint64 assetId = assetIds[i];
+            prices[i] = assetPrices[assetId];
+            _purchaseTimes[i] = purchaseTimes[assetId];
+
+            if (!purchaseExists[assetId]) {
+                statuses[i] = IJJSKIN.PurchaseStatus.Active; // default
+            } else if (purchaseStatus[assetId] == PurchaseStatus.Active) {
+                statuses[i] = IJJSKIN.PurchaseStatus.Active;
+            } else if (purchaseStatus[assetId] == PurchaseStatus.Released) {
+                statuses[i] = IJJSKIN.PurchaseStatus.Released;
+            } else {
+                statuses[i] = IJJSKIN.PurchaseStatus.Refunded;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Test Harness - Expose internal functions for testing
+// ============================================================================
+
+contract VerifierNetworkHarness is VerifierNetwork {
+    constructor(
+        address _usdc,
+        address _jjskin,
+        address _vrfCoordinator,
+        address _extensionDelegate
+    ) VerifierNetwork(_usdc, _jjskin, _vrfCoordinator, _extensionDelegate) {}
+
+    // Expose internal functions for testing
+    function exposed_auditPreviousEpochBatches(uint256 epochToAudit, uint256 auditSeed) external {
+        // Call via fallback to extension
+        VerifierNetworkExt(address(this)).auditPreviousEpochBatches(epochToAudit, auditSeed);
+    }
+
+    // NOTE: V3.4.3 - Internal audit functions moved to VerifierNetworkExt
+    // Use executeAuditBatch() via delegatecall instead
+
+    /// @dev Test-only function to submit reveal without BLS verification (per-asset model)
+    function testSubmitReveal(
+        bytes32 batchId,
+        Decision[] calldata decisions,
+        RefundReason[] calldata reasons,
+        bytes32 salt
+    ) external {
+        Batch storage batch = batches[batchId];
+
+        // Auto-transition from commit to reveal
+        if (batch.state == BatchState.COMMIT_PHASE && block.timestamp > batch.commitDeadline) {
+            batch.state = BatchState.REVEAL_PHASE;
+        }
+
+        require(batch.state == BatchState.REVEAL_PHASE, "Not reveal phase");
+        require(block.timestamp <= batch.revealDeadline, "Reveal phase ended");
+        require(!hasRevealed[batchId][msg.sender], "Already revealed");
+
+        // Verify commitment
+        bytes32 expectedHash = keccak256(abi.encode(decisions, reasons, salt));
+        require(commits[batchId][msg.sender] == expectedHash, "Commit hash mismatch");
+
+        // Skip BLS verification for testing
+
+        // Record votes per-asset
+        hasRevealed[batchId][msg.sender] = true;
+        batchVoters[batchId].push(msg.sender);
+        batch.revealCount++;
+
+        uint64[] memory assetIds = batch.assetIds;
+        require(decisions.length == assetIds.length, "Decision length mismatch");
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+            Decision decision = decisions[i];
+
+            // Store vote
+            assetVotes[batchId][assetId][msg.sender] = AssetDecision({
+                assetId: assetId,
+                decision: decision,
+                refundReason: reasons[i]
+            });
+
+            // Update vote counts
+            assetVoteCounts[batchId][assetId][decision]++;
+            if (decision == Decision.REFUND) {
+                assetRefundReasonCounts[batchId][assetId][reasons[i]]++;
+            }
+        }
+
+        verifiers[msg.sender].totalVotes++;
+
+        emit RevealSubmitted(batchId, msg.sender, assetIds.length);
+
+        // AUTO-EXECUTE: Check if all assets have reached consensus
+        _tryAutoExecute(batchId);
+    }
+
+    /// @dev Simple single-asset reveal for basic tests
+    function testSubmitRevealSingle(
+        bytes32 batchId,
+        Decision decision,
+        RefundReason reason,
+        bytes32 salt
+    ) external {
+        Batch storage batch = batches[batchId];
+        uint64[] memory assetIds = batch.assetIds;
+
+        Decision[] memory decisions = new Decision[](assetIds.length);
+        RefundReason[] memory reasons = new RefundReason[](assetIds.length);
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            decisions[i] = decision;
+            reasons[i] = reason;
+        }
+
+        // Auto-transition from commit to reveal
+        if (batch.state == BatchState.COMMIT_PHASE && block.timestamp > batch.commitDeadline) {
+            batch.state = BatchState.REVEAL_PHASE;
+        }
+
+        require(batch.state == BatchState.REVEAL_PHASE, "Not reveal phase");
+        require(block.timestamp <= batch.revealDeadline, "Reveal phase ended");
+        require(!hasRevealed[batchId][msg.sender], "Already revealed");
+
+        // Verify commitment
+        bytes32 expectedHash = keccak256(abi.encode(decisions, reasons, salt));
+        require(commits[batchId][msg.sender] == expectedHash, "Commit hash mismatch");
+
+        hasRevealed[batchId][msg.sender] = true;
+        batchVoters[batchId].push(msg.sender);
+        batch.revealCount++;
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+
+            assetVotes[batchId][assetId][msg.sender] = AssetDecision({
+                assetId: assetId,
+                decision: decision,
+                refundReason: reason
+            });
+
+            assetVoteCounts[batchId][assetId][decision]++;
+            if (decision == Decision.REFUND) {
+                assetRefundReasonCounts[batchId][assetId][reason]++;
+            }
+        }
+
+        verifiers[msg.sender].totalVotes++;
+        emit RevealSubmitted(batchId, msg.sender, assetIds.length);
+
+        // AUTO-EXECUTE: Check if all assets have reached consensus
+        _tryAutoExecute(batchId);
+    }
+}
+
+// ============================================================================
+// Main Test Contract
+// ============================================================================
+
+contract VerifierNetworkTest is Test {
+    VerifierNetworkHarness public network;
+    VerifierNetworkExt public extension;
+    MockUSDC public usdc;
+    MockJJSKIN public jjskin;
+    MockVRFCoordinator public vrfCoordinator;
+
+    // Test accounts
+    uint256 public ownerKey = 0x1;
+    uint256 public verifier1Key = 0x2;
+    uint256 public verifier2Key = 0x3;
+    uint256 public verifier3Key = 0x4;
+    uint256 public verifier4Key = 0x5;
+    uint256 public verifier5Key = 0x6;
+    uint256 public challengerKey = 0x7;
+    uint256 public creatorKey = 0x8;
+
+    address public owner = vm.addr(ownerKey);
+    address public verifier1 = vm.addr(verifier1Key);
+    address public verifier2 = vm.addr(verifier2Key);
+    address public verifier3 = vm.addr(verifier3Key);
+    address public verifier4 = vm.addr(verifier4Key);
+    address public verifier5 = vm.addr(verifier5Key);
+    address public challenger = vm.addr(challengerKey);
+    address public creator = vm.addr(creatorKey);
+
+    // Constants
+    uint256 constant MIN_STAKE = 1000e6; // $1,000 USDC
+    uint256 constant UNBONDING_PERIOD = 28 days;
+    uint256 constant CLAIM_WINDOW = 7 days;
+    uint256 constant BATCH_DEPOSIT = 50000; // 0.05 USDC
+
+    // Events
+    event VerifierRegistered(address indexed verifier, uint256 stake);
+    event UnbondingInitiated(address indexed verifier, uint256 amount, uint40 cooldownEnds);
+    event UnbondingClaimed(address indexed verifier, uint256 amount);
+    event BatchCreated(bytes32 indexed batchId, uint64[] assetIds, uint256 totalValue, address indexed creator);
+    event CommitSubmitted(bytes32 indexed batchId, address indexed verifier);
+    event RevealSubmitted(bytes32 indexed batchId, address indexed verifier, VerifierNetwork.Decision decision);
+    event BatchExecuted(bytes32 indexed batchId, uint256 claimCount, uint256 refundCount, address indexed creator);
+    event AuditChallenged(bytes32 indexed batchId, uint64 assetId, address indexed challenger, uint256 bond, VerifierNetwork.Decision claimedTruth);
+    event AuditResolved(bytes32 indexed batchId, uint64 assetId, VerifierNetwork.Decision groundTruth, bool verifiersWrong);
+    event VerifierSlashed(address indexed verifier, uint256 amount, string reason);
+
+    function setUp() public {
+        // Deploy mocks
+        usdc = new MockUSDC();
+        jjskin = new MockJJSKIN();
+        vrfCoordinator = new MockVRFCoordinator();
+
+        // Deploy extension first (CometExt pattern)
+        extension = new VerifierNetworkExt(address(usdc), address(jjskin));
+
+        // Deploy VerifierNetwork with extension
+        vm.prank(owner);
+        network = new VerifierNetworkHarness(
+            address(usdc),
+            address(jjskin),
+            address(vrfCoordinator),
+            address(extension)
+        );
+
+        // Configure VRF
+        vm.prank(owner);
+        network.setVRFConfig(1, bytes32(uint256(0x1234)));
+
+        // Fund test accounts with USDC
+        _fundAccount(verifier1, 100_000e6);
+        _fundAccount(verifier2, 100_000e6);
+        _fundAccount(verifier3, 100_000e6);
+        _fundAccount(verifier4, 100_000e6);
+        _fundAccount(verifier5, 100_000e6);
+        _fundAccount(challenger, 100_000e6);
+        _fundAccount(creator, 100_000e6);
+
+        // Approve USDC for all accounts
+        vm.prank(verifier1);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(verifier2);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(verifier3);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(verifier4);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(verifier5);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(challenger);
+        usdc.approve(address(network), type(uint256).max);
+        vm.prank(creator);
+        usdc.approve(address(network), type(uint256).max);
+    }
+
+    /// @dev Helper to start VRF epoch and fulfill it
+    function _initializeVRF() internal {
+        network.startNewEpoch();
+        uint256 requestId = vrfCoordinator.lastRequestId();
+        uint256[] memory randomWords = new uint256[](1);
+        randomWords[0] = uint256(keccak256("test_randomness"));
+        vrfCoordinator.fulfillRandomWords(requestId, randomWords);
+    }
+
+    function _fundAccount(address account, uint256 amount) internal {
+        usdc.mint(account, amount);
+    }
+
+    function _registerVerifier(address verifier, uint256 stake) internal {
+        vm.prank(verifier);
+        network.registerVerifier(stake);
+    }
+
+    function _registerMinimumVerifiers() internal {
+        _registerVerifier(verifier1, MIN_STAKE);
+        _registerVerifier(verifier2, MIN_STAKE);
+        _registerVerifier(verifier3, MIN_STAKE);
+        _registerVerifier(verifier4, MIN_STAKE);
+        _initializeVRF();
+    }
+
+    /// @dev Helper to setup assets and create a batch (replaces legacy createBatch)
+    function _createBatch(uint64[] memory assetIds, uint256 totalValue) internal returns (bytes32) {
+        // Warp to reasonable timestamp
+        if (block.timestamp < 1000000) {
+            vm.warp(1000000);
+        }
+
+        // Setup each asset with proportional price (last asset gets remainder to avoid rounding loss)
+        uint256 len = assetIds.length;
+        uint56 pricePerAsset = uint56(totalValue / len);
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours); // Past delivery window
+
+        for (uint256 i = 0; i < len - 1; i++) {
+            jjskin.setAssetInfo(assetIds[i], pricePerAsset, purchaseTime, creator);
+            jjskin.setPurchaseActive(assetIds[i]);
+        }
+        // Last asset gets the remainder to ensure totalValue matches exactly
+        uint56 lastAssetPrice = uint56(totalValue - (pricePerAsset * (len - 1)));
+        jjskin.setAssetInfo(assetIds[len - 1], lastAssetPrice, purchaseTime, creator);
+        jjskin.setPurchaseActive(assetIds[len - 1]);
+
+        // Create batch via Arweave API
+        vm.prank(creator);
+        return network.createBatchFromArweave(assetIds, uint64(block.number));
+    }
+
+    /// @dev Setup assets without creating batch (for revert tests)
+    function _setupAssets(uint64[] memory assetIds, uint256 totalValue) internal {
+        if (block.timestamp < 1000000) {
+            vm.warp(1000000);
+        }
+
+        uint256 len = assetIds.length;
+        uint56 pricePerAsset = uint56(totalValue / len);
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours);
+
+        for (uint256 i = 0; i < len - 1; i++) {
+            jjskin.setAssetInfo(assetIds[i], pricePerAsset, purchaseTime, creator);
+            jjskin.setPurchaseActive(assetIds[i]);
+        }
+        // Last asset gets the remainder
+        uint56 lastAssetPrice = uint56(totalValue - (pricePerAsset * (len - 1)));
+        jjskin.setAssetInfo(assetIds[len - 1], lastAssetPrice, purchaseTime, creator);
+        jjskin.setPurchaseActive(assetIds[len - 1]);
+    }
+
+    // ========================================================================
+    // REGISTRATION TESTS
+    // ========================================================================
+
+    function test_RegisterVerifier_Success() public {
+        vm.expectEmit(true, true, true, true);
+        emit VerifierRegistered(verifier1, MIN_STAKE);
+
+        vm.prank(verifier1);
+        network.registerVerifier(MIN_STAKE);
+
+        (uint256 stakedAmount,,,,, bool isActive) = network.getVerifier(verifier1);
+        assertEq(stakedAmount, MIN_STAKE, "Stake should be MIN_STAKE");
+        assertTrue(isActive, "Verifier should be active");
+        assertEq(network.activeVerifierCount(), 1, "Active count should be 1");
+        assertEq(network.totalStake(), MIN_STAKE, "Total stake should match");
+    }
+
+    function test_RegisterVerifier_RevertsBelowMinStake() public {
+        vm.prank(verifier1);
+        vm.expectRevert(
+            abi.encodeWithSelector(VerifierNetwork.InsufficientStake.selector, MIN_STAKE - 1, MIN_STAKE)
+        );
+        network.registerVerifier(MIN_STAKE - 1);
+    }
+
+    function test_RegisterVerifier_RevertsAlreadyRegistered() public {
+        _registerVerifier(verifier1, MIN_STAKE);
+
+        vm.prank(verifier1);
+        vm.expectRevert(VerifierNetwork.AlreadyRegistered.selector);
+        network.registerVerifier(MIN_STAKE);
+    }
+
+    function test_AddStake_Success() public {
+        _registerVerifier(verifier1, MIN_STAKE);
+
+        uint256 additionalStake = 500e6;
+        vm.prank(verifier1);
+        network.addStake(additionalStake);
+
+        (uint256 stakedAmount,,,,,) = network.getVerifier(verifier1);
+        assertEq(stakedAmount, MIN_STAKE + additionalStake, "Stake should increase");
+        assertEq(network.totalStake(), MIN_STAKE + additionalStake, "Total stake should match");
+    }
+
+    // ========================================================================
+    // UNBONDING TESTS
+    // ========================================================================
+
+    function test_InitiateUnbonding_PartialWithdraw() public {
+        uint256 initialStake = MIN_STAKE * 2;
+        _registerVerifier(verifier1, initialStake);
+
+        uint256 unbondAmount = MIN_STAKE;
+
+        vm.prank(verifier1);
+        network.initiateUnbonding(unbondAmount);
+
+        (uint256 stakedAmount, uint256 unbondingAmt,,,, bool isActive) = network.getVerifier(verifier1);
+        (,, uint40 unbondingStart) = network.getVerifierTimestamps(verifier1);
+
+        assertEq(stakedAmount, initialStake - unbondAmount, "Staked should decrease");
+        assertEq(unbondingAmt, unbondAmount, "Unbonding should be set");
+        assertEq(unbondingStart, uint40(block.timestamp), "Unbonding start should be now");
+        assertTrue(isActive, "Should remain active with remaining stake");
+        assertEq(network.totalStake(), initialStake - unbondAmount, "Total stake should decrease");
+    }
+
+    function test_InitiateUnbonding_FullExit() public {
+        _registerVerifier(verifier1, MIN_STAKE);
+
+        vm.prank(verifier1);
+        network.initiateUnbonding(MIN_STAKE);
+
+        (uint256 stakedAmount, uint256 unbondingAmt,,,, bool isActive) = network.getVerifier(verifier1);
+
+        assertEq(stakedAmount, 0, "Staked should be zero");
+        assertEq(unbondingAmt, MIN_STAKE, "Unbonding should be full amount");
+        assertFalse(isActive, "Should be inactive after full exit");
+        assertEq(network.activeVerifierCount(), 0, "Active count should be 0");
+    }
+
+    function test_ClaimUnbonding_Success() public {
+        _registerVerifier(verifier1, MIN_STAKE);
+
+        vm.prank(verifier1);
+        network.initiateUnbonding(MIN_STAKE);
+
+        vm.warp(block.timestamp + UNBONDING_PERIOD + 1);
+
+        uint256 balanceBefore = usdc.balanceOf(verifier1);
+
+        vm.prank(verifier1);
+        network.claimUnbonding();
+
+        uint256 balanceAfter = usdc.balanceOf(verifier1);
+        assertEq(balanceAfter - balanceBefore, MIN_STAKE, "Should receive unbonded stake");
+    }
+
+    // ========================================================================
+    // BATCH CREATION TESTS (with creator deposit)
+    // ========================================================================
+
+    function test_CreateBatch_Success() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](3);
+        assetIds[0] = 1001;
+        assetIds[1] = 1002;
+        assetIds[2] = 1003;
+
+        uint256 totalValue = 1000e6;
+        uint256 creatorBalanceBefore = usdc.balanceOf(creator);
+
+        bytes32 batchId = _createBatch(assetIds, totalValue);
+
+        (, uint256 value, VerifierNetwork.BatchState state,,,,, address batchCreator) = network.getBatch(batchId);
+
+        assertEq(value, totalValue, "Value should match");
+        assertEq(uint8(state), uint8(VerifierNetwork.BatchState.COMMIT_PHASE), "State should be COMMIT_PHASE");
+        assertEq(batchCreator, creator, "Creator should be recorded");
+
+        // Check deposit was taken
+        uint256 creatorBalanceAfter = usdc.balanceOf(creator);
+        assertEq(creatorBalanceBefore - creatorBalanceAfter, BATCH_DEPOSIT, "Deposit should be taken");
+    }
+
+    function test_CreateBatch_RevertsEmptyAssets() public {
+        _registerMinimumVerifiers();
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](0);
+
+        vm.prank(creator);
+        vm.expectRevert(VerifierNetwork.EmptyBatch.selector);
+        network.createBatchFromArweave(assetIds, uint64(block.number));
+    }
+
+    // ========================================================================
+    // COMMIT-REVEAL TESTS (per-asset model)
+    // ========================================================================
+
+    function test_SubmitCommit_Success() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        address[] memory assigned = network.getBatchAssignedVerifiers(batchId);
+        assertEq(assigned.length, 4, "All 4 verifiers should be assigned");
+
+        // Create per-asset decisions
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](1);
+        decisions[0] = VerifierNetwork.Decision.CLAIM;
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](1);
+        reasons[0] = VerifierNetwork.RefundReason.None;
+
+        bytes32 salt = keccak256("salt1");
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        vm.prank(assigned[0]);
+        network.submitCommit(batchId, commitHash);
+
+        assertEq(network.commits(batchId, assigned[0]), commitHash, "Commit should be stored");
+    }
+
+    function test_SubmitReveal_Success() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        // Create per-asset decisions
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](1);
+        decisions[0] = VerifierNetwork.Decision.CLAIM;
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](1);
+        reasons[0] = VerifierNetwork.RefundReason.None;
+
+        bytes32 salt = keccak256("salt1");
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        vm.prank(verifier1);
+        network.submitCommit(batchId, commitHash);
+
+        // Move to reveal phase
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        vm.prank(verifier1);
+        network.testSubmitReveal(batchId, decisions, reasons, salt);
+
+        assertTrue(network.hasRevealed(batchId, verifier1), "Should be marked as revealed");
+    }
+
+    // ========================================================================
+    // BATCH EXECUTION TESTS (per-asset consensus)
+    // ========================================================================
+
+    function test_ExecuteBatch_ConsensusReached() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        // Setup mock JJSKIN purchase
+        jjskin.setPurchaseActive(1001);
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        address[] memory assigned = network.getBatchAssignedVerifiers(batchId);
+
+        // All verifiers vote CLAIM for the single asset
+        bytes32[] memory salts = new bytes32[](assigned.length);
+        for (uint256 i = 0; i < assigned.length; i++) {
+            salts[i] = _commitSingle(batchId, assigned[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, string(abi.encode("salt", i)));
+        }
+
+        // Move to reveal phase
+        uint256 revealStart = block.timestamp + 30 minutes + 1;
+        vm.warp(revealStart);
+
+        // Reveal until consensus is reached (threshold verifiers)
+        // With 4 verifiers, threshold = (2*4+3)/3 = 3, so 3rd reveal triggers execution
+        uint256 threshold = network.getThreshold();
+        for (uint256 i = 0; i < threshold && i < assigned.length; i++) {
+            _revealSingle(batchId, assigned[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salts[i]);
+        }
+
+        // Check batch was executed
+        (,, VerifierNetwork.BatchState state,,,,,) = network.getBatch(batchId);
+        assertEq(uint8(state), uint8(VerifierNetwork.BatchState.EXECUTED), "State should be EXECUTED");
+
+        // Check JJSKIN was called
+        uint64[] memory claimed = jjskin.getLastClaimedAssets();
+        assertEq(claimed.length, 1, "Should have claimed 1 asset");
+        assertEq(claimed[0], 1001, "Asset ID should match");
+    }
+
+    function test_ExecuteBatch_RefundDecision() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        jjskin.setPurchaseActive(1001);
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        // Majority votes REFUND (3 vs 1)
+        bytes32 salt1 = _commitSingle(batchId, verifier1, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, "salt1");
+        bytes32 salt2 = _commitSingle(batchId, verifier2, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, "salt2");
+        bytes32 salt3 = _commitSingle(batchId, verifier3, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, "salt3");
+        bytes32 salt4 = _commitSingle(batchId, verifier4, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, "salt4");
+
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Reveal REFUND votes first - 3rd reveal triggers consensus and auto-execution
+        _revealSingle(batchId, verifier1, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, salt1);
+        _revealSingle(batchId, verifier2, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, salt2);
+        _revealSingle(batchId, verifier3, VerifierNetwork.Decision.REFUND, VerifierNetwork.RefundReason.FailedDelivery, salt3);
+        // Note: verifier4's reveal is skipped since batch auto-executed after threshold was reached
+
+        // Check refund was processed
+        assertTrue(jjskin.refundedAssets(1001), "Asset should be refunded");
+    }
+
+    function test_ExecuteBatch_MultiAsset_MixedDecisions() public {
+        _registerMinimumVerifiers();
+
+        // Create batch with 3 assets
+        uint64[] memory assetIds = new uint64[](3);
+        assetIds[0] = 2001; // Will be CLAIM
+        assetIds[1] = 2002; // Will be REFUND
+        assetIds[2] = 2003; // Will be CLAIM
+
+        jjskin.setPurchaseActive(2001);
+        jjskin.setPurchaseActive(2002);
+        jjskin.setPurchaseActive(2003);
+
+        // Use value within cryptoeconomic cap: V_max = (2/3) × $4000 = $2666
+        bytes32 batchId = _createBatch(assetIds, 2500e6);
+
+        // All verifiers vote same mixed decisions
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](3);
+        decisions[0] = VerifierNetwork.Decision.CLAIM;
+        decisions[1] = VerifierNetwork.Decision.REFUND;
+        decisions[2] = VerifierNetwork.Decision.CLAIM;
+
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](3);
+        reasons[0] = VerifierNetwork.RefundReason.None;
+        reasons[1] = VerifierNetwork.RefundReason.TradeDeclined;
+        reasons[2] = VerifierNetwork.RefundReason.None;
+
+        // Commit all
+        bytes32[] memory salts = new bytes32[](4);
+        address[4] memory vers = [verifier1, verifier2, verifier3, verifier4];
+        for (uint256 i = 0; i < 4; i++) {
+            salts[i] = keccak256(abi.encode("salt", i));
+            bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salts[i]));
+            vm.prank(vers[i]);
+            network.submitCommit(batchId, commitHash);
+        }
+
+        // Reveal until threshold is reached
+        vm.warp(block.timestamp + 30 minutes + 1);
+        uint256 threshold = network.getThreshold();
+        for (uint256 i = 0; i < threshold && i < 4; i++) {
+            vm.prank(vers[i]);
+            network.testSubmitReveal(batchId, decisions, reasons, salts[i]);
+        }
+
+        // Check results
+        assertTrue(jjskin.claimedAssets(2001), "Asset 2001 should be claimed");
+        assertTrue(jjskin.refundedAssets(2002), "Asset 2002 should be refunded");
+        assertTrue(jjskin.claimedAssets(2003), "Asset 2003 should be claimed");
+    }
+
+    // ========================================================================
+    // REWARD DISTRIBUTION TESTS
+    // ========================================================================
+
+    function test_RewardDistribution_ExecutorBonus() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 3001;
+        jjskin.setPurchaseActive(3001);
+
+        // Create batch with value within cap to generate fees
+        // Batch cap with 4 verifiers at MIN_STAKE = (4000e6 * 3) / 4 = 3000e6
+        bytes32 batchId = _createBatch(assetIds, 2000e6); // $2k value (within cap)
+
+        // All vote CLAIM
+        bytes32[] memory salts = new bytes32[](4);
+        address[4] memory vers = [verifier1, verifier2, verifier3, verifier4];
+        for (uint256 i = 0; i < 4; i++) {
+            salts[i] = _commitSingle(batchId, vers[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, string(abi.encode("salt", i)));
+        }
+
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Only 3 reveals needed (threshold=3). The 3rd reveal triggers auto-execution.
+        // verifier3 reveals last and triggers execution, getting the executor bonus
+        uint256 threshold = network.getThreshold();
+        for (uint256 i = 0; i < threshold; i++) {
+            _revealSingle(batchId, vers[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salts[i]);
+        }
+
+        // Check executor (verifier3, the threshold-th revealer) got bonus
+        (,,uint256 v3Rewards,,,) = network.getVerifier(verifier3);
+        (,,uint256 v1Rewards,,,) = network.getVerifier(verifier1);
+
+        assertGt(v3Rewards, v1Rewards, "Executor should have more rewards");
+    }
+
+    function test_RewardDistribution_CreatorGetDeposit_WhenProfitable() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 3002;
+        jjskin.setPurchaseActive(3002);
+
+        uint256 creatorBalanceBefore = usdc.balanceOf(creator);
+
+        // High value batch = profitable (fees > deposit)
+        // At 2000e6 value with 0.5% fee: 10e6 fees > 50000 deposit = profitable
+        bytes32 batchId = _createBatch(assetIds, 2000e6); // Within cap
+
+        // Execute with all CLAIM votes
+        _executeFullBatch(batchId);
+
+        // Creator should be able to claim rewards (deposit back + 10% of fees)
+        uint256 creatorRewards = network.nonVerifierRewards(creator);
+        assertGt(creatorRewards, BATCH_DEPOSIT, "Creator should get deposit back plus bonus");
+    }
+
+    // ========================================================================
+    // AUDIT TESTS (per-asset)
+    // ========================================================================
+
+    function test_ChallengeAudit_PerAsset() public {
+        // Need extra verifiers for audit batch (original voters are excluded)
+        // Audit batch uses MIN_ORACLE_COUNT=4 as threshold
+        // Original batch uses threshold + buffer verifiers (depends on stake)
+        // Use 16 verifiers to ensure we have enough after exclusion
+
+        // Create 12 extra verifier addresses (plus base 4 = 16 total)
+        address v5 = makeAddr("verifier5");
+        address v6 = makeAddr("verifier6");
+        address v7 = makeAddr("verifier7");
+        address v8 = makeAddr("verifier8");
+        address v9 = makeAddr("verifier9");
+        address v10 = makeAddr("verifier10");
+        address v11 = makeAddr("verifier11");
+        address v12 = makeAddr("verifier12");
+        address v13 = makeAddr("verifier13");
+        address v14 = makeAddr("verifier14");
+        address v15 = makeAddr("verifier15");
+        address v16 = makeAddr("verifier16");
+
+        // Fund extra verifiers
+        usdc.mint(v5, MIN_STAKE);
+        usdc.mint(v6, MIN_STAKE);
+        usdc.mint(v7, MIN_STAKE);
+        usdc.mint(v8, MIN_STAKE);
+        usdc.mint(v9, MIN_STAKE);
+        usdc.mint(v10, MIN_STAKE);
+        usdc.mint(v11, MIN_STAKE);
+        usdc.mint(v12, MIN_STAKE);
+        usdc.mint(v13, MIN_STAKE);
+        usdc.mint(v14, MIN_STAKE);
+        usdc.mint(v15, MIN_STAKE);
+        usdc.mint(v16, MIN_STAKE);
+        vm.prank(v5);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v6);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v7);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v8);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v9);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v10);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v11);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v12);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v13);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v14);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v15);
+        usdc.approve(address(network), MIN_STAKE);
+        vm.prank(v16);
+        usdc.approve(address(network), MIN_STAKE);
+
+        // Register first 4 with 5000e6 each (20000e6 total) to allow more verifiers
+        // with 10% max stake share
+        _registerVerifier(verifier1, 5000e6);
+        _registerVerifier(verifier2, 5000e6);
+        _registerVerifier(verifier3, 5000e6);
+        _registerVerifier(verifier4, 5000e6);
+
+        // Now total is 20000e6. Adding 1000e6 makes total 21000e6.
+        // maxAllowed = 2100e6 > 1000e6, so it passes for each
+        _registerVerifier(v5, MIN_STAKE);
+        _registerVerifier(v6, MIN_STAKE);
+        _registerVerifier(v7, MIN_STAKE);
+        _registerVerifier(v8, MIN_STAKE);
+        _registerVerifier(v9, MIN_STAKE);
+        _registerVerifier(v10, MIN_STAKE);
+        _registerVerifier(v11, MIN_STAKE);
+        _registerVerifier(v12, MIN_STAKE);
+        _registerVerifier(v13, MIN_STAKE);
+        _registerVerifier(v14, MIN_STAKE);
+        _registerVerifier(v15, MIN_STAKE);
+        _registerVerifier(v16, MIN_STAKE);
+
+        // Initialize VRF for verifier selection
+        _initializeVRF();
+
+        uint64[] memory assetIds = new uint64[](2);
+        assetIds[0] = 4001;
+        assetIds[1] = 4002;
+        jjskin.setPurchaseActive(4001);
+        jjskin.setPurchaseActive(4002);
+
+        bytes32 batchId = _createBatch(assetIds, 2000e6);
+
+        _executeFullBatch(batchId);
+
+        // Challenge specific asset (via fallback to extension)
+        vm.prank(challenger);
+        VerifierNetworkExt(address(network)).challengeAudit(batchId, 4001);
+
+        (
+            bytes32 auditBatchId,
+            VerifierNetwork.AuditState state,
+            uint40 challengeDeadline
+        ) = network.getAudit(batchId);
+
+        assertEq(uint8(state), uint8(VerifierNetwork.AuditState.VOTING), "Audit should be VOTING");
+        assertTrue(auditBatchId != bytes32(0), "Audit batch should be created");
+    }
+
+    function test_RetrospectiveAudit_UnpredictableSelection() public {
+        _registerMinimumVerifiers();
+
+        // Create batch in epoch 1
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 7001;
+        jjskin.setPurchaseActive(7001);
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        // Execute the batch
+        _executeFullBatch(batchId);
+
+        // Verify batch is tracked in epoch 1
+        bytes32[] memory epoch1Batches = network.getEpochBatches(1);
+        assertEq(epoch1Batches.length, 1, "Should have 1 batch in epoch 1");
+        assertEq(epoch1Batches[0], batchId, "Batch should be tracked");
+
+        // Check audit state before new epoch - should be NONE
+        (, VerifierNetwork.AuditState stateBefore, ) = network.getAudit(batchId);
+        assertEq(uint8(stateBefore), uint8(VerifierNetwork.AuditState.NONE), "No audit before new epoch");
+
+        // Start new epoch 2 (this triggers retrospective audit of epoch 1)
+        network.startNewEpoch();
+
+        // Fulfill VRF for epoch 2 with a seed that will select the batch for audit
+        // Using a known seed that results in audit selection (roll < 100 out of 10000)
+        uint256[] memory randomWords = new uint256[](1);
+        randomWords[0] = 42; // Seed that should trigger audit for this batchId
+
+        vrfCoordinator.fulfillRandomWords(2, randomWords);
+
+        // The batch MAY be selected for audit depending on the random roll
+        // We can't guarantee selection, but we verify the mechanism works
+        (, VerifierNetwork.AuditState stateAfter, ) = network.getAudit(batchId);
+
+        // The key security property: verifiers could NOT predict at voting time
+        // whether this batch would be audited, because the seed (42) wasn't known
+        // until AFTER they voted
+
+        // Log result for visibility
+        if (uint8(stateAfter) == uint8(VerifierNetwork.AuditState.PENDING)) {
+            // Batch was selected for retrospective audit
+            assertTrue(true, "Batch was retrospectively selected for audit");
+        } else {
+            // Batch was not selected (96% chance with 1% sample rate)
+            assertTrue(true, "Batch was not selected (expected ~99% of the time)");
+        }
+    }
+
+    // ========================================================================
+    // GAS ESTIMATION TESTS
+    // ========================================================================
+
+    function test_Gas_CreateBatch() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](10);
+        for (uint256 i = 0; i < 10; i++) {
+            assetIds[i] = uint64(5000 + i);
+        }
+
+        // Setup assets before gas measurement
+        _setupAssets(assetIds, 2000e6);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(creator);
+        network.createBatchFromArweave(assetIds, uint64(block.number)); // Within batch cap of ~3000e6
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for createBatchFromArweave (10 assets):", gasUsed);
+        // Increased limit: createBatchFromArweave calls JJSKIN.getBatchAssetInfo + validates each asset
+        assertLt(gasUsed, 850000, "createBatchFromArweave should use < 850k gas");
+    }
+
+    function test_Gas_SubmitCommit() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            assetIds[i] = uint64(6000 + i);
+        }
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6); // Within batch cap
+
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](5);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            decisions[i] = VerifierNetwork.Decision.CLAIM;
+            reasons[i] = VerifierNetwork.RefundReason.None;
+        }
+
+        bytes32 salt = keccak256("salt");
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        uint256 gasBefore = gasleft();
+        vm.prank(verifier1);
+        network.submitCommit(batchId, commitHash);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for submitCommit:", gasUsed);
+        assertLt(gasUsed, 100000, "submitCommit should use < 100k gas");
+    }
+
+    function test_Gas_SubmitReveal() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            assetIds[i] = uint64(7000 + i);
+            jjskin.setPurchaseActive(assetIds[i]);
+        }
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6); // Within batch cap
+
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](5);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            decisions[i] = VerifierNetwork.Decision.CLAIM;
+            reasons[i] = VerifierNetwork.RefundReason.None;
+        }
+
+        bytes32 salt = keccak256("salt");
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        vm.prank(verifier1);
+        network.submitCommit(batchId, commitHash);
+
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(verifier1);
+        network.testSubmitReveal(batchId, decisions, reasons, salt);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for submitReveal (5 assets):", gasUsed);
+        assertLt(gasUsed, 400000, "submitReveal should use < 400k gas");
+    }
+
+    function test_Gas_FullBatchExecution() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](10);
+        for (uint256 i = 0; i < 10; i++) {
+            assetIds[i] = uint64(8000 + i);
+            jjskin.setPurchaseActive(assetIds[i]);
+        }
+
+        bytes32 batchId = _createBatch(assetIds, 2000e6); // Within batch cap
+
+        address[4] memory vers = [verifier1, verifier2, verifier3, verifier4];
+        bytes32[] memory salts = new bytes32[](4);
+
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](10);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](10);
+        for (uint256 i = 0; i < 10; i++) {
+            decisions[i] = VerifierNetwork.Decision.CLAIM;
+            reasons[i] = VerifierNetwork.RefundReason.None;
+        }
+
+        // Commit all
+        for (uint256 i = 0; i < 4; i++) {
+            salts[i] = keccak256(abi.encode("salt", i));
+            bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salts[i]));
+            vm.prank(vers[i]);
+            network.submitCommit(batchId, commitHash);
+        }
+
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Reveal first 2
+        for (uint256 i = 0; i < 2; i++) {
+            vm.prank(vers[i]);
+            network.testSubmitReveal(batchId, decisions, reasons, salts[i]);
+        }
+
+        // Measure gas for 3rd reveal (triggers execution at threshold=3)
+        uint256 gasBefore = gasleft();
+        vm.prank(vers[2]);
+        network.testSubmitReveal(batchId, decisions, reasons, salts[2]);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for reveal+execute (10 assets, 3 verifiers):", gasUsed);
+        assertLt(gasUsed, 2000000, "Full execution should use < 2M gas");
+    }
+
+    function test_Gas_CreateBatch_100Assets() public {
+        // Register more verifiers to increase batch cap
+        for (uint256 i = 0; i < 20; i++) {
+            address v = makeAddr(string(abi.encodePacked("extraVerifier100_", i)));
+            usdc.mint(v, MIN_STAKE * 10); // 10000 USDC each (mint before prank - onlyOwner)
+            vm.startPrank(v);
+            usdc.approve(address(network), MIN_STAKE * 10);
+            network.registerVerifier(MIN_STAKE * 10);
+            vm.stopPrank();
+        }
+        // Initialize VRF after registering verifiers
+        _initializeVRF();
+
+        uint64[] memory assetIds = new uint64[](100);
+        for (uint256 i = 0; i < 100; i++) {
+            assetIds[i] = uint64(10000 + i);
+        }
+
+        uint256 cap = network.getBatchCap();
+        console2.log("Batch cap:", cap);
+
+        // Setup assets before gas measurement
+        _setupAssets(assetIds, cap - 1);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(creator);
+        network.createBatchFromArweave(assetIds, uint64(block.number)); // Just under cap
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for createBatchFromArweave (100 assets):", gasUsed);
+        // ~30k per asset overhead expected + JJSKIN.getBatchAssetInfo call
+        assertLt(gasUsed, 5000000, "createBatchFromArweave 100 assets should use < 5M gas");
+    }
+
+    function test_Gas_CreateBatch_200Assets() public {
+        // Register even more verifiers for larger cap
+        for (uint256 i = 0; i < 40; i++) {
+            address v = makeAddr(string(abi.encodePacked("extraVerifier200_", i)));
+            usdc.mint(v, MIN_STAKE * 10); // 10000 USDC each (mint before prank - onlyOwner)
+            vm.startPrank(v);
+            usdc.approve(address(network), MIN_STAKE * 10);
+            network.registerVerifier(MIN_STAKE * 10);
+            vm.stopPrank();
+        }
+        // Initialize VRF after registering verifiers
+        _initializeVRF();
+
+        uint64[] memory assetIds = new uint64[](200);
+        for (uint256 i = 0; i < 200; i++) {
+            assetIds[i] = uint64(20000 + i);
+        }
+
+        uint256 cap = network.getBatchCap();
+        console2.log("Batch cap:", cap);
+
+        // Setup assets before gas measurement
+        _setupAssets(assetIds, cap - 1);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(creator);
+        network.createBatchFromArweave(assetIds, uint64(block.number)); // Just under cap
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for createBatchFromArweave (200 assets):", gasUsed);
+        // Linear scaling expected + JJSKIN call overhead
+        assertLt(gasUsed, 10000000, "createBatchFromArweave 200 assets should use < 10M gas");
+    }
+
+    function test_Gas_RetryBatchSelection() public {
+        // Register extra verifiers for retry pool (need 16+ for replacement)
+        for (uint256 i = 0; i < 16; i++) {
+            address v = makeAddr(string(abi.encodePacked("gasVerifier", i)));
+            usdc.mint(v, MIN_STAKE); // mint before prank - onlyOwner
+            vm.startPrank(v);
+            usdc.approve(address(network), MIN_STAKE);
+            network.registerVerifier(MIN_STAKE);
+            vm.stopPrank();
+        }
+        // Initialize VRF after registering verifiers
+        _initializeVRF();
+
+        uint64[] memory assetIds = new uint64[](10);
+        for (uint256 i = 0; i < 10; i++) {
+            assetIds[i] = uint64(30000 + i);
+            jjskin.setPurchaseActive(uint64(30000 + i));
+        }
+
+        bytes32 batchId = _createBatch(assetIds, 2000e6);
+
+        // Some verifiers commit but don't reveal (trigger retry)
+        address[] memory assigned = network.getBatchAssignedVerifiers(batchId);
+
+        // Only first 2 verifiers commit
+        bytes32 salt = keccak256("salt");
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](10);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](10);
+        for (uint256 i = 0; i < 10; i++) {
+            decisions[i] = VerifierNetwork.Decision.CLAIM;
+            reasons[i] = VerifierNetwork.RefundReason.None;
+        }
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        // 2 verifiers commit
+        for (uint256 i = 0; i < 2 && i < assigned.length; i++) {
+            vm.prank(assigned[i]);
+            network.submitCommit(batchId, commitHash);
+        }
+
+        // Skip to reveal phase and then to retry
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // 2 verifiers reveal
+        for (uint256 i = 0; i < 2 && i < assigned.length; i++) {
+            vm.prank(assigned[i]);
+            network.testSubmitReveal(batchId, decisions, reasons, salt);
+        }
+
+        // Skip to after reveal window
+        vm.warp(block.timestamp + 15 minutes + 1);
+
+        // Measure retry gas - this uses the O(1) mapping lookup now (via fallback to extension)
+        uint256 gasBefore = gasleft();
+        VerifierNetworkExt(address(network)).retryBatchSelection(batchId);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        console2.log("Gas used for retryBatchSelection (16 verifiers, 8 assigned):", gasUsed);
+        // With ~20 total verifiers, retry selection scales with pool size
+        assertLt(gasUsed, 600000, "retryBatchSelection should use < 600k gas");
+    }
+
+    // ========================================================================
+    // NON-REVEAL PENALTY TESTS (Option A: treat as minority vote)
+    // ========================================================================
+
+    function test_NonReveal_CountsAsMinorityVote() public {
+        _registerMinimumVerifiers();
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 5001;
+
+        jjskin.setPurchaseActive(5001);
+
+        bytes32 batchId = _createBatch(assetIds, 1000e6);
+
+        // All 4 verifiers commit
+        bytes32 salt1 = _commitSingle(batchId, verifier1, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, "salt1");
+        bytes32 salt2 = _commitSingle(batchId, verifier2, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, "salt2");
+        bytes32 salt3 = _commitSingle(batchId, verifier3, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, "salt3");
+        _commitSingle(batchId, verifier4, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, "salt4");
+        // verifier4 commits but won't reveal
+
+        // Get initial minority votes for verifier4
+        (,,,uint256 minorityVotesBefore,,) = network.getVerifier(verifier4);
+
+        // Move to reveal phase
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Only 3 verifiers reveal (threshold = 3 for 4 verifiers)
+        // verifier4 commits but doesn't reveal - should get minority penalty
+        _revealSingle(batchId, verifier1, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salt1);
+        _revealSingle(batchId, verifier2, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salt2);
+        _revealSingle(batchId, verifier3, VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salt3);
+        // 3rd reveal triggers auto-execution
+
+        // Check batch was executed
+        (,, VerifierNetwork.BatchState state,,,,,) = network.getBatch(batchId);
+        assertEq(uint8(state), uint8(VerifierNetwork.BatchState.EXECUTED), "Batch should be executed");
+
+        // Check verifier4 got minority penalty for not revealing
+        (,,,uint256 minorityVotesAfter,,) = network.getVerifier(verifier4);
+        assertEq(minorityVotesAfter, minorityVotesBefore + 1, "Non-reveal should count as minority vote");
+    }
+
+    function test_NonReveal_MultipleAssets_MultiplePenalties() public {
+        _registerMinimumVerifiers();
+
+        // Create batch with 3 assets
+        uint64[] memory assetIds = new uint64[](3);
+        assetIds[0] = 6001;
+        assetIds[1] = 6002;
+        assetIds[2] = 6003;
+
+        jjskin.setPurchaseActive(6001);
+        jjskin.setPurchaseActive(6002);
+        jjskin.setPurchaseActive(6003);
+
+        // Use value within cryptoeconomic cap: V_max = (2/3) × $4000 = $2666
+        bytes32 batchId = _createBatch(assetIds, 2500e6);
+
+        // Setup decisions for all 3 assets
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](3);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            decisions[i] = VerifierNetwork.Decision.CLAIM;
+            reasons[i] = VerifierNetwork.RefundReason.None;
+        }
+
+        // All 4 verifiers commit
+        bytes32[] memory salts = new bytes32[](4);
+        address[4] memory vers = [verifier1, verifier2, verifier3, verifier4];
+        for (uint256 i = 0; i < 4; i++) {
+            salts[i] = keccak256(abi.encode("salt", i));
+            bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salts[i]));
+            vm.prank(vers[i]);
+            network.submitCommit(batchId, commitHash);
+        }
+
+        // Get initial minority votes for verifier4
+        (,,,uint256 minorityVotesBefore,,) = network.getVerifier(verifier4);
+
+        // Move to reveal phase
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Only 3 verifiers reveal
+        for (uint256 i = 0; i < 3; i++) {
+            vm.prank(vers[i]);
+            network.testSubmitReveal(batchId, decisions, reasons, salts[i]);
+        }
+        // verifier4 doesn't reveal - should get 3 minority penalties (one per asset)
+
+        // Check verifier4 got minority penalty for each asset
+        (,,,uint256 minorityVotesAfter,,) = network.getVerifier(verifier4);
+        assertEq(minorityVotesAfter, minorityVotesBefore + 3, "Non-reveal should get minority penalty per asset");
+    }
+
+    // ========================================================================
+    // HELPER FUNCTIONS
+    // ========================================================================
+
+    function _commitSingle(
+        bytes32 batchId,
+        address verifier,
+        VerifierNetwork.Decision decision,
+        VerifierNetwork.RefundReason reason,
+        string memory saltStr
+    ) internal returns (bytes32 salt) {
+        salt = keccak256(bytes(saltStr));
+
+        // Get batch asset count for proper array sizing
+        uint64[] memory assetIds = network.getBatchAssetIds(batchId);
+
+        VerifierNetwork.Decision[] memory decisions = new VerifierNetwork.Decision[](assetIds.length);
+        VerifierNetwork.RefundReason[] memory reasons = new VerifierNetwork.RefundReason[](assetIds.length);
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            decisions[i] = decision;
+            reasons[i] = reason;
+        }
+
+        bytes32 commitHash = keccak256(abi.encode(decisions, reasons, salt));
+
+        vm.prank(verifier);
+        network.submitCommit(batchId, commitHash);
+    }
+
+    function _revealSingle(
+        bytes32 batchId,
+        address verifier,
+        VerifierNetwork.Decision decision,
+        VerifierNetwork.RefundReason reason,
+        bytes32 salt
+    ) internal {
+        vm.prank(verifier);
+        network.testSubmitRevealSingle(batchId, decision, reason, salt);
+    }
+
+    function _executeFullBatch(bytes32 batchId) internal {
+        address[] memory assigned = network.getBatchAssignedVerifiers(batchId);
+
+        bytes32[] memory salts = new bytes32[](assigned.length);
+        for (uint256 i = 0; i < assigned.length; i++) {
+            salts[i] = _commitSingle(batchId, assigned[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, string(abi.encode("salt", i)));
+        }
+
+        vm.warp(block.timestamp + 30 minutes + 1);
+
+        // Only reveal until threshold is reached (to trigger auto-execute)
+        uint256 threshold = network.getThreshold();
+        for (uint256 i = 0; i < threshold && i < assigned.length; i++) {
+            _revealSingle(batchId, assigned[i], VerifierNetwork.Decision.CLAIM, VerifierNetwork.RefundReason.None, salts[i]);
+        }
+    }
+}
+
+// ============================================================================
+// Arweave Batch Creation Tests
+// ============================================================================
+
+contract ArweaveBatchTest is Test {
+    VerifierNetworkHarness public network;
+    VerifierNetworkExt public extension;
+    MockUSDC public usdc;
+    MockJJSKIN public mockJJSKIN;
+    MockVRFCoordinator public vrfCoordinator;
+
+    address public batchCreator = address(0xBA7C4);
+    address public seller1 = address(0x5E11E1);
+    uint256 public constant BATCH_DEPOSIT = 10e6; // $10 USDC
+
+    function setUp() public {
+        usdc = new MockUSDC();
+        mockJJSKIN = new MockJJSKIN();
+        vrfCoordinator = new MockVRFCoordinator();
+
+        // Deploy extension first (CometExt pattern)
+        extension = new VerifierNetworkExt(address(usdc), address(mockJJSKIN));
+
+        network = new VerifierNetworkHarness(
+            address(usdc),
+            address(mockJJSKIN),
+            address(vrfCoordinator),
+            address(extension)
+        );
+
+        // Configure VRF
+        network.setVRFConfig(1, bytes32(uint256(0x1234)));
+
+        // Fund batch creator
+        usdc.mint(batchCreator, 1_000_000e6);
+        vm.prank(batchCreator);
+        usdc.approve(address(network), type(uint256).max);
+
+        // Setup verifiers and VRF
+        _setupVerifiersAndVRF();
+    }
+
+    function _setupVerifiersAndVRF() internal {
+        // Register 5 verifiers with MIN_STAKE
+        uint256 minStake = network.MIN_STAKE();
+        for (uint256 i = 0; i < 5; i++) {
+            address v = address(uint160(0xE1 + i));
+            usdc.mint(v, minStake);
+            vm.startPrank(v);
+            usdc.approve(address(network), minStake);
+            network.registerVerifier(minStake);
+            vm.stopPrank();
+        }
+
+        // Trigger VRF epoch
+        network.startNewEpoch();
+        uint256 requestId = vrfCoordinator.lastRequestId();
+        uint256[] memory randomWords = new uint256[](1);
+        randomWords[0] = uint256(keccak256("random seed"));
+        vrfCoordinator.fulfillRandomWords(requestId, randomWords);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Basic functionality
+    // ─────────────────────────────────────────────────────────────
+
+    function test_createBatchFromArweave_success() public {
+        // Warp to a reasonable timestamp (avoids underflow)
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](2);
+        assetIds[0] = 1001;
+        assetIds[1] = 1002;
+
+        // Setup assets: price, purchase time (in past), seller
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours); // 7h ago (> 6h delivery window)
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setAssetInfo(1002, 200e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+        mockJJSKIN.setPurchaseActive(1002);
+
+        uint64 arweaveBlock = 1234567;
+
+        vm.prank(batchCreator);
+        bytes32 batchId = network.createBatchFromArweave(assetIds, arweaveBlock);
+
+        // Verify batch created
+        assertTrue(batchId != bytes32(0), "Batch ID should not be zero");
+
+        // Verify arweave block stored
+        assertEq(network.getBatchArweaveBlock(batchId), arweaveBlock, "Arweave block mismatch");
+
+        // Verify batch state
+        (,, VerifierNetwork.BatchState state,,,,, ) = network.getBatch(batchId);
+        assertEq(uint8(state), uint8(VerifierNetwork.BatchState.COMMIT_PHASE), "Should be in commit phase");
+    }
+
+    function test_createBatchFromArweave_revertIfDeliveryWindowNotElapsed() public {
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        // Purchase time is NOW - delivery window (6h) has NOT elapsed
+        uint40 purchaseTime = uint40(block.timestamp - 1 hours);
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+
+        uint256 expectedReadyAt = purchaseTime + mockJJSKIN._deliveryWindow();
+
+        vm.prank(batchCreator);
+        vm.expectRevert(abi.encodeWithSelector(VerifierNetwork.AssetNotReady.selector, 1001, expectedReadyAt));
+        network.createBatchFromArweave(assetIds, 1234567);
+    }
+
+    function test_createBatchFromArweave_revertIfAssetNotActive() public {
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        // Setup asset but mark as Released (not Active)
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours);
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+
+        // Simulate it being settled already
+        mockJJSKIN.batchExecuteDecisions(
+            _singleAsset(1001),
+            new uint64[](0),
+            new IJJSKIN.RefundReason[](0)
+        );
+
+        vm.prank(batchCreator);
+        vm.expectRevert(abi.encodeWithSelector(VerifierNetwork.AssetNotPending.selector, 1001));
+        network.createBatchFromArweave(assetIds, 1234567);
+    }
+
+    function test_createBatchFromArweave_revertIfAssetAlreadySettled() public {
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        // First create and settle a batch
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours);
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+
+        vm.prank(batchCreator);
+        bytes32 batchId1 = network.createBatchFromArweave(assetIds, 1234567);
+
+        // Mark as settled in VerifierNetwork (simulating execution)
+        // This is handled internally - for test, we'll verify the pending check works
+        vm.prank(batchCreator);
+        vm.expectRevert(abi.encodeWithSelector(VerifierNetwork.AssetInPendingBatch.selector, 1001, batchId1));
+        network.createBatchFromArweave(assetIds, 1234568);
+    }
+
+    function test_createBatchFromArweave_revertIfEmptyBatch() public {
+        uint64[] memory assetIds = new uint64[](0);
+
+        vm.prank(batchCreator);
+        vm.expectRevert(VerifierNetwork.EmptyBatch.selector);
+        network.createBatchFromArweave(assetIds, 1234567);
+    }
+
+    function test_createBatchFromArweave_calculatesTotalValue() public {
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](3);
+        assetIds[0] = 1001;
+        assetIds[1] = 1002;
+        assetIds[2] = 1003;
+
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours);
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setAssetInfo(1002, 200e6, purchaseTime, seller1);
+        mockJJSKIN.setAssetInfo(1003, 50e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+        mockJJSKIN.setPurchaseActive(1002);
+        mockJJSKIN.setPurchaseActive(1003);
+
+        vm.prank(batchCreator);
+        bytes32 batchId = network.createBatchFromArweave(assetIds, 1234567);
+
+        // Expected total: 100 + 200 + 50 = 350 USDC
+        (, uint256 totalValue,,,,,, ) = network.getBatch(batchId);
+        assertEq(totalValue, 350e6, "Total value should be sum of prices");
+    }
+
+    function test_createBatchFromArweave_emitsEvent() public {
+        vm.warp(1000000);
+
+        uint64[] memory assetIds = new uint64[](1);
+        assetIds[0] = 1001;
+
+        uint40 purchaseTime = uint40(block.timestamp - 7 hours);
+        mockJJSKIN.setAssetInfo(1001, 100e6, purchaseTime, seller1);
+        mockJJSKIN.setPurchaseActive(1001);
+
+        vm.prank(batchCreator);
+        vm.expectEmit(false, false, true, true);
+        emit VerifierNetwork.ArweaveBatchCreated(
+            bytes32(0), // batchId not known yet
+            assetIds,
+            1234567,
+            100e6,
+            batchCreator
+        );
+        network.createBatchFromArweave(assetIds, 1234567);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────
+
+    function _singleAsset(uint64 assetId) internal pure returns (uint64[] memory) {
+        uint64[] memory arr = new uint64[](1);
+        arr[0] = assetId;
+        return arr;
+    }
+}

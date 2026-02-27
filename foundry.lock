@@ -1,0 +1,38 @@
+{
+  "lib/chainlink": {
+    "tag": {
+      "name": "v2.31.0",
+      "rev": "43c8eb20c6721e19f6404e923d85ca5eb792f715"
+    }
+  },
+  "lib/chainlink-brownie-contracts": {
+    "tag": {
+      "name": "1.3.0",
+      "rev": "5cb41fbc9b525338b6098da5ea7dd0b7e92f89e4"
+    }
+  },
+  "lib/contracts": {
+    "tag": {
+      "name": "v3.15.0",
+      "rev": "5c96c223f53a6b3e9c9db2c0a8d1766727d901c1"
+    }
+  },
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.14.0",
+      "rev": "1801b0541f4fda118a10798fd3486bb7051c5dd6"
+    }
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.5.0",
+      "rev": "fcbae5394ae8ad52d8e580a3477db99814b9d565"
+    }
+  },
+  "lib/risc0-ethereum": {
+    "tag": {
+      "name": "v3.0.1",
+      "rev": "365e7b2db4f620fa256580c27558d2623362b9ae"
+    }
+  }
+}

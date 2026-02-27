@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+/**
+ * @title CryptoeconomicSecurity
+ * @author JJSKIN / Lumio
+ * @notice Academic formulas for verifier network cryptoeconomic security
+ * @dev Implements security model from STAKESURE (arXiv:2401.05797) and Algorand
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CORE SECURITY PRINCIPLE
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * A verifier network is cryptoeconomically secure if:
+ *
+ *     Cost of Corruption  >  Profit from Corruption
+ *
+ * From STAKESURE paper:
+ *     - Cost of Corruption = (2/3) × S_committee × σ
+ *     - Profit from Corruption ≤ V (batch value)
+ *
+ * Security constraint:
+ *     (2/3) × S_committee × σ > V
+ *
+ * Rearranging for minimum committee stake:
+ *     S_committee > (3/2) × V / σ = 1.5V / σ
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * THE MASTER EQUATION
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *     k × S_avg × σ  ≥  1.5 × V
+ *
+ * Where:
+ *     k     = Committee size (number of verifiers)
+ *     S_avg = Average stake per committee member
+ *     σ     = Slashing rate (0-1, expressed in BPS as 0-10000)
+ *     V     = Batch value (amount at risk)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DERIVED FORMULAS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Formula 1 - Minimum Committee Stake:
+ *     S_committee ≥ (3V) / (2σ) = 1.5V / σ
+ *
+ * Formula 2 - Minimum Committee Size:
+ *     k ≥ S_committee / S_avg = 1.5V / (σ × S_avg)
+ *
+ * Formula 3 - Maximum Batch Value:
+ *     V_max = (2/3) × k × S_avg × σ
+ *
+ * Formula 4 - Required Stake per Verifier:
+ *     S_verifier ≥ 1.5V / (σ × k)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REFERENCES
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * [1] STAKESURE: Proof of Stake Mechanisms with Strong Cryptoeconomic Safety
+ *     https://arxiv.org/abs/2401.05797
+ *
+ * [2] Algorand: Scaling Byzantine Agreements for Cryptocurrencies
+ *     https://people.csail.mit.edu/nickolai/papers/gilad-algorand.pdf
+ *
+ * [3] The Cryptoeconomics of Slashing (a16z)
+ *     https://a16zcrypto.com/posts/article/the-cryptoeconomics-of-slashing/
+ *
+ * [4] A Game Theoretic Analysis of Validator Strategies in Ethereum 2.0
+ *     https://arxiv.org/abs/2405.03357
+ */
+library CryptoeconomicSecurity {
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Security margin α = 1.5 (derived from BFT 2/3 threshold inverse: 3/2)
+    /// @dev From STAKESURE: CoC = (2/3) × S × σ, so S ≥ (3/2) × V / σ
+    uint256 internal constant ALPHA_NUMERATOR = 3;
+    uint256 internal constant ALPHA_DENOMINATOR = 2;
+
+    /// @notice Basis points denominator
+    uint256 internal constant BPS = 10000;
+
+    /// @notice Minimum BFT committee size (allows f=1 fault with n=3f+1=4)
+    uint256 internal constant MIN_BFT_COMMITTEE = 4;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FORMULA IMPLEMENTATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Formula 1: Calculate minimum committee stake for a batch value
+     * @dev S_committee ≥ (α × V) / σ = (1.5 × V) / σ
+     *
+     * Derivation:
+     *     Security requires: CoC > PoC
+     *     (2/3) × S × σ > V
+     *     S > V × (3/2) / σ
+     *     S > 1.5V / σ
+     *
+     * @param batchValue The total value of assets in the batch (V)
+     * @param slashingRateBPS Slashing rate in basis points (σ × 10000)
+     * @return minStake Minimum total stake required for the committee
+     */
+    function minCommitteeStake(
+        uint256 batchValue,
+        uint256 slashingRateBPS
+    ) internal pure returns (uint256 minStake) {
+        if (slashingRateBPS == 0) return type(uint256).max;
+
+        // S ≥ (α × V) / σ = (3/2 × V) / (σ_bps / 10000)
+        // S ≥ (3 × V × 10000) / (2 × σ_bps)
+        minStake = (ALPHA_NUMERATOR * batchValue * BPS) / (ALPHA_DENOMINATOR * slashingRateBPS);
+    }
+
+    /**
+     * @notice Formula 2: Calculate minimum committee size for a batch
+     * @dev k ≥ S_committee / S_avg = (1.5 × V) / (σ × S_avg)
+     *
+     * Derivation:
+     *     From Formula 1: S_committee ≥ 1.5V / σ
+     *     With k members of average stake S_avg:
+     *     k × S_avg ≥ 1.5V / σ
+     *     k ≥ 1.5V / (σ × S_avg)
+     *
+     * @param batchValue The total value of assets in the batch (V)
+     * @param avgStake Average stake per verifier (S_avg)
+     * @param slashingRateBPS Slashing rate in basis points (σ × 10000)
+     * @return minSize Minimum number of committee members required
+     */
+    function minCommitteeSize(
+        uint256 batchValue,
+        uint256 avgStake,
+        uint256 slashingRateBPS
+    ) internal pure returns (uint256 minSize) {
+        if (avgStake == 0) return type(uint256).max;
+
+        uint256 requiredStake = minCommitteeStake(batchValue, slashingRateBPS);
+
+        // Ceiling division: (a + b - 1) / b
+        minSize = (requiredStake + avgStake - 1) / avgStake;
+
+        // Enforce BFT minimum
+        if (minSize < MIN_BFT_COMMITTEE) {
+            minSize = MIN_BFT_COMMITTEE;
+        }
+    }
+
+    /**
+     * @notice Formula 3: Calculate maximum secure batch value for a committee
+     * @dev V_max = (2/3) × S_committee × σ
+     *
+     * Derivation:
+     *     Security requires: (2/3) × S × σ > V
+     *     Maximum V where equality holds:
+     *     V_max = (2/3) × S × σ
+     *
+     * @param committeeStake Total stake of the committee (S_committee)
+     * @param slashingRateBPS Slashing rate in basis points (σ × 10000)
+     * @return maxValue Maximum batch value that can be securely processed
+     */
+    function maxBatchValue(
+        uint256 committeeStake,
+        uint256 slashingRateBPS
+    ) internal pure returns (uint256 maxValue) {
+        // V_max = (2/3) × S × σ = (2 × S × σ_bps) / (3 × 10000)
+        maxValue = (ALPHA_DENOMINATOR * committeeStake * slashingRateBPS) / (ALPHA_NUMERATOR * BPS);
+    }
+
+    /**
+     * @notice Formula 4: Calculate required stake per verifier for a batch
+     * @dev S_verifier ≥ (1.5 × V) / (σ × k)
+     *
+     * Derivation:
+     *     From the master equation: k × S_avg × σ ≥ 1.5V
+     *     Solving for S_avg:
+     *     S_avg ≥ 1.5V / (σ × k)
+     *
+     * @param batchValue The total value of assets in the batch (V)
+     * @param committeeSize Number of verifiers in committee (k)
+     * @param slashingRateBPS Slashing rate in basis points (σ × 10000)
+     * @return minStake Minimum stake required per verifier
+     */
+    function minStakePerVerifier(
+        uint256 batchValue,
+        uint256 committeeSize,
+        uint256 slashingRateBPS
+    ) internal pure returns (uint256 minStake) {
+        if (committeeSize == 0) return type(uint256).max;
+
+        uint256 totalRequired = minCommitteeStake(batchValue, slashingRateBPS);
+        minStake = (totalRequired + committeeSize - 1) / committeeSize; // Ceiling
+    }
+
+    /**
+     * @notice Check if a committee configuration is cryptoeconomically secure
+     * @dev Validates: k × S_avg × σ ≥ α × V (where α = 1.5)
+     *
+     * @param batchValue The total value of assets in the batch (V)
+     * @param committeeStake Total stake of the committee
+     * @param slashingRateBPS Slashing rate in basis points
+     * @return secure True if the configuration meets security requirements
+     */
+    function isSecure(
+        uint256 batchValue,
+        uint256 committeeStake,
+        uint256 slashingRateBPS
+    ) internal pure returns (bool secure) {
+        // Check: (2/3) × S × σ ≥ V
+        // Equivalent: 2 × S × σ_bps ≥ 3 × V × BPS
+        uint256 lhs = ALPHA_DENOMINATOR * committeeStake * slashingRateBPS;
+        uint256 rhs = ALPHA_NUMERATOR * batchValue * BPS;
+
+        secure = lhs >= rhs;
+    }
+
+    /**
+     * @notice Calculate the bribery cost to corrupt a committee
+     * @dev Cost = T × S_avg × σ, where T = ⌈2k/3⌉ (BFT threshold)
+     *
+     * From game theory: rational attack requires bribe > slashing cost
+     *
+     * @param committeeSize Number of verifiers (k)
+     * @param avgStake Average stake per verifier
+     * @param slashingRateBPS Slashing rate in basis points
+     * @return cost Minimum cost to successfully bribe the committee
+     */
+    function briberyCost(
+        uint256 committeeSize,
+        uint256 avgStake,
+        uint256 slashingRateBPS
+    ) internal pure returns (uint256 cost) {
+        // BFT threshold: T = ⌈(2k+1)/3⌉
+        uint256 threshold = (2 * committeeSize + 3) / 3;
+
+        // Cost = T × S_avg × σ
+        cost = (threshold * avgStake * slashingRateBPS) / BPS;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UTILITY FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Calculate BFT threshold for a committee size
+     * @dev T = ⌈(2n+1)/3⌉ - ensures >2/3 supermajority
+     *
+     * @param n Committee size
+     * @return threshold Minimum votes required for consensus
+     */
+    function bftThreshold(uint256 n) internal pure returns (uint256 threshold) {
+        threshold = (2 * n + 3) / 3; // Ceiling of (2n+1)/3
+    }
+
+    /**
+     * @notice Calculate maximum faults tolerable by a committee
+     * @dev f = ⌊(n-1)/3⌋ - BFT can tolerate up to f Byzantine nodes
+     *
+     * @param n Committee size
+     * @return faults Maximum Byzantine faults tolerable
+     */
+    function maxFaults(uint256 n) internal pure returns (uint256 faults) {
+        if (n == 0) return 0;
+        faults = (n - 1) / 3;
+    }
+}

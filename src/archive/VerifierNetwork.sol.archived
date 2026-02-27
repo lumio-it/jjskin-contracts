@@ -1,0 +1,1604 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {CryptoeconomicSecurity} from "./libraries/CryptoeconomicSecurity.sol";
+import {IJJSKIN} from "./interfaces/IJJSKIN.sol";
+
+/**
+ * @title VerifierNetwork
+ * @author JJSKIN / Lumio
+ * @notice Production-grade decentralized verifier network with stake-weighted self-selection
+ *
+ * @dev ═══════════════════════════════════════════════════════════════════════════════
+ *      GAME THEORY MODEL
+ *      ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *      This contract implements an incentive-compatible oracle mechanism based on:
+ *
+ *      1. SCHELLING POINT (Kleros Yellow Paper)
+ *         - Voters coordinate on truth expecting others to do the same
+ *         - "Jurors who vote incoherently lose PNK to coherent jurors"
+ *         - Reference: https://kleros.io/yellowpaper.pdf
+ *
+ *      2. STAKE REDISTRIBUTION (UMA DVM 2.0)
+ *         - "Slashing redistributes tokens from wrong voters to correct voters"
+ *         - Minority voters are slashed; majority voters receive slashed stake
+ *         - Reference: https://docs.uma.xyz/protocol-overview/dvm-2.0
+ *
+ *      3. CRYPTOECONOMIC SECURITY (STAKESURE, arXiv:2401.05797)
+ *         - Cost of Corruption > Profit from Corruption
+ *         - Security margin: (2/3) × S_committee × σ > V
+ *         - Reference: https://arxiv.org/abs/2401.05797
+ *
+ *      4. VRF SORTITION (Algorand, Gilad et al.)
+ *         - Stake-weighted self-selection prevents committee prediction
+ *         - Dynamic τ increases participation on retries
+ *         - Reference: https://people.csail.mit.edu/nickolai/papers/gilad-algorand.pdf
+ *
+ *      INCENTIVE STRUCTURE:
+ *      ┌────────────────────────┬─────────────────────────────────────────────────┐
+ *      │ Behavior               │ Consequence                                     │
+ *      ├────────────────────────┼─────────────────────────────────────────────────┤
+ *      │ Vote with majority     │ Receive share of fees + slashed minority stake │
+ *      │ Vote with minority     │ Lose 5% stake per vote (max 20% per batch)     │
+ *      │ Vote NONE (abstain)    │ Treated as minority - slashed + no reward      │
+ *      │ Commit but no reveal   │ Lose 10% stake (slashNoReveal)                 │
+ *      │ Selected but no commit │ Lose 10% stake (slashNoCommit)                 │
+ *      └────────────────────────┴─────────────────────────────────────────────────┘
+ *
+ *      NASH EQUILIBRIUM: Honest reporting is the dominant strategy because:
+ *      - Expected reward for honest vote > Expected reward for dishonest vote
+ *      - Cost of bribery = (QUORUM × avg_stake × SLASH_MINORITY_BPS) > batch value
+ *
+ *      SECURITY MODEL & ASSUMPTIONS:
+ *      - Honest majority assumption: ≥67% of staked value is held by honest actors
+ *      - Majority attack protection via:
+ *        (a) VRF-based unpredictable committee selection (can't pre-plan attack)
+ *        (b) Commit-reveal prevents vote-after-seeing-others
+ *        (c) Stake-weighted selection makes majority control expensive
+ *      - No on-chain appeal mechanism (by design - keeps system simple)
+ *      - Off-chain recourse: governance, reputation systems, dispute resolution
+ *
+ *      ═══════════════════════════════════════════════════════════════════════════════
+ *      TECHNICAL FEATURES
+ *      ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *      - Algorand-style stake-weighted sortition (VRF-based self-selection)
+ *      - O(1) VRF callback + chunked finalization
+ *      - Bucket-aware concentration cap
+ *      - Continuous concentration enforcement
+ *      - Rebuild-start griefing protection
+ *      - Deferred suspension with needsSuspension flag
+ *      - Coherent voting rewards with minority slashing
+ *      - Non-participation slashing via slashNoCommit
+ *
+ * Architecture:
+ * - Self-selection: verifiers prove eligibility via _isSelected()
+ * - Selection-only snapshots: updated at epoch finalization + forced changes
+ * - Dynamic τ for retries: τ_round = 7 + round * 2
+ * - One participation per batch: prevents slashing bugs
+ * - Epoch-bound batches: stale-epoch batches fail on retry
+ * - Coherent voting: only majority voters receive rewards
+ * - Minority slashing: 5% stake per incoherent vote, redistributed
+ * - Non-participation slashing: 10% for selected but non-committing
+ * - NONE votes treated as incoherent to prevent risk-free abstention
+ * - Per-batch slash cap: max 20% stake loss per batch
+ * - Symmetric payoff: selectionStake for both penalty and reward
+ */
+contract VerifierNetwork is ReentrancyGuard, VRFConsumerBaseV2Plus {
+    using SafeERC20 for IERC20;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TYPES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    enum Decision { NONE, CLAIM, REFUND, INVALID }
+
+    enum RefundReason { None, FailedDelivery, TradeReversed, TradeDeclined, Expired }
+
+    struct AssetDecision {
+        uint64 assetId;
+        Decision decision;
+        RefundReason refundReason;
+    }
+
+    enum BatchState { NONE, COMMIT_PHASE, REVEAL_PHASE, READY, EXECUTED }
+
+    enum AuditState { NONE, PENDING, VOTING, RESOLVED }
+
+    /// @notice Verifier registration and state
+    struct Verifier {
+        uint256 stakedAmount;       // USDC staked (live, includes unbonding until claimed)
+        uint256 selectionStake;     // Epoch-locked stake for selection (snapshot)
+        uint256 unbondingAmount;    // Amount marked for unbonding (still slashable!)
+        uint256 pendingRewards;     // Accumulated rewards
+        uint256 minorityVotes;      // Times voted with minority (per-asset)
+        uint256 totalVotes;         // Total asset-votes cast
+        uint256 assignedBatches;    // Total batches participated in
+        uint40 registeredAt;        // Registration timestamp
+        uint40 lastSlashTime;       // Last time slashed
+        uint40 unbondingStart;      // When unbonding started
+        uint8 minorityWarnings;     // Warning count for minority voting
+        uint8 participationWarnings; // Warning count for low participation
+        bool isActive;              // Currently active
+    }
+
+    /// @notice Batch for commit-reveal voting
+    struct Batch {
+        uint64[] assetIds;
+        uint128 totalValue;
+        uint128 creatorDeposit;
+        uint40 commitDeadline;
+        uint40 revealDeadline;
+        uint40 executedAt;
+        uint40 createdAt;
+        BatchState state;
+        uint16 revealCount;
+        uint8 currentRound;
+        bool isAuditBatch;
+        address creator;
+        uint64 arweaveBlock;
+        address executor;
+        uint256 batchEpoch;
+        bytes32 createdEntropy;
+    }
+
+    struct AuditBatchMeta {
+        bytes32 originalBatchId;
+        address challenger;
+    }
+
+    struct AssetConsensus {
+        Decision decision;
+        RefundReason refundReason;
+        uint8 votesFor;
+        bool hasConsensus;
+    }
+
+    struct Audit {
+        bytes32 auditBatchId;
+        AuditState state;
+        uint40 challengeDeadline;
+    }
+
+    struct Epoch {
+        uint256 vrfRequestId;
+        uint256 randomSeed;
+        uint40 startTime;
+        bool fulfilled;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    uint256 public constant MIN_STAKE = 1000e6;
+    uint256 public constant MIN_ORACLE_COUNT = 4;
+    uint256 public constant CONCENTRATION_ENFORCEMENT_MIN = 10;
+    uint256 public constant MIN_COMMITTEE_SIZE = 4;
+    uint256 public constant MAX_COMMITTEE_SIZE = 64;
+    uint256 public constant COMMITTEE_VALUE_UNIT = 100e6;
+    uint256 public constant COMMIT_WINDOW = 30 minutes;
+    uint256 public constant REVEAL_WINDOW = 15 minutes;
+    uint256 public constant UNBONDING_PERIOD = 28 days;
+    uint256 public constant CLAIM_WINDOW = 7 days;
+    uint256 public constant AUDIT_CHALLENGE_WINDOW = 2 hours;
+    uint256 public constant AUDIT_RESOLUTION_DEADLINE = 72 hours;
+    uint256 public constant AUDIT_BOND_BPS = 500;
+    uint256 public constant MIN_AUDIT_BOND = 100e6;
+    uint256 public constant AUDIT_SAMPLE_RATE_BPS = 100;
+    uint256 public constant VERIFIER_SHARE_BPS = 9000;
+    uint256 public constant CREATOR_SHARE_BPS = 1000;
+    uint256 public constant EXECUTOR_BONUS_BPS = 500;
+    uint256 public constant SLASH_MINORITY_BPS = 500;
+    uint256 public constant SLASH_AUDIT_FAIL_BPS = 10000;
+    uint256 public constant MAX_BATCH_SLASH_BPS = 2000; // Max 20% stake loss per batch
+    uint256 private constant BPS = 10000;
+    uint256 public constant DEFAULT_BATCH_DEPOSIT = 50000;
+    uint256 public constant MAX_BATCH_SIZE = 200;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SELF-SELECTION PARAMETERS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Base expected committee size (τ) - increases with retry round
+    uint256 public constant EXPECTED_COMMITTEE_SIZE = 7;
+
+    /// @notice τ increment per retry round
+    uint256 public constant TAU_ROUND_INCREMENT = 2;
+
+    /// @notice Quorum required for consensus
+    uint256 public constant QUORUM = 5;
+
+    /// @notice Maximum retry rounds before batch fails
+    uint256 public constant MAX_ROUNDS = 3;
+
+    /// @notice Number of stake buckets (log₂ scale)
+    uint256 public constant MAX_BUCKETS = 14;
+
+    /// @notice Bucket base equals MIN_STAKE
+    uint256 public constant BUCKET_BASE = MIN_STAKE;
+
+    /// @notice Safety margin for cryptoeconomic security
+    uint256 public constant SECURITY_MARGIN_BPS = 15000;
+
+    /// @notice Chunk size for epoch finalization
+    uint256 public constant EPOCH_FINALIZE_CHUNK_SIZE = 50;
+
+    /// @notice Timeout for VRF fulfillment
+    uint256 public constant EPOCH_VRF_TIMEOUT = 1 hours;
+
+    /// @notice Minimum interval between epoch starts
+    uint256 public constant EPOCH_MIN_INTERVAL = 4 hours;
+
+    /// @notice Timeout for finalization after VRF
+    uint256 public constant EPOCH_FINALIZE_TIMEOUT = 6 hours;
+
+    /// @notice Maximum τ value
+    uint256 public constant TAU_MAX = 11;
+
+    /// @notice Safety factor for concentration cap
+    uint256 public constant CONCENTRATION_FACTOR = 2;
+
+    /// @notice Bond required to start new epoch
+    uint256 public constant EPOCH_STARTER_BOND = 10e6;
+
+    /// @notice Reward per finalization chunk
+    uint256 public constant FINALIZE_CHUNK_REWARD = 1e6;
+
+    /// @notice Maximum batch value
+    uint256 public constant MAX_BATCH_VALUE = 25_000_000e6;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // IMMUTABLES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    IERC20 public immutable usdc;
+    address public immutable jjskin;
+    address public immutable extensionDelegate;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VRF CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    uint256 public s_subscriptionId;
+    bytes32 public s_keyHash;
+    uint32 public s_callbackGasLimit = 100000;
+    uint16 public s_requestConfirmations = 3;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    uint256 public totalStake;
+    uint256 public activeVerifierCount;
+    uint256 public currentEpoch;
+    uint256 public slashingTreasury;
+    address public treasuryBeneficiary;
+    uint256 public batchDeposit = DEFAULT_BATCH_DEPOSIT;
+
+    mapping(address => Verifier) internal _verifiers;
+    address[] public activeVerifierList;
+    mapping(address => uint256) private verifierIndex;
+    mapping(bytes32 => Batch) internal _batches;
+    mapping(bytes32 => AuditBatchMeta) public auditBatchMeta;
+    mapping(bytes32 => mapping(address => bytes32)) public commits;
+    mapping(bytes32 => mapping(address => bool)) public hasRevealed;
+    mapping(bytes32 => address[]) public batchVoters;
+    mapping(bytes32 => mapping(uint64 => mapping(address => AssetDecision))) public assetVotes;
+    mapping(bytes32 => mapping(uint64 => mapping(Decision => uint16))) public assetVoteCounts;
+    mapping(bytes32 => mapping(uint64 => mapping(RefundReason => uint16))) public assetRefundReasonCounts;
+    mapping(bytes32 => mapping(uint64 => AssetConsensus)) public assetConsensus;
+    mapping(uint256 => Epoch) public epochs;
+    mapping(uint256 => address[]) public epochVerifiers;
+    mapping(uint256 => bytes32[]) public epochBatches;
+    mapping(uint256 => uint256) public vrfRequestToEpoch;
+    mapping(bytes32 => Audit) public audits;
+    mapping(bytes32 => address[]) public batchAssignedVerifiers;
+    mapping(bytes32 => mapping(address => bool)) public batchVerifierAssigned;
+    mapping(bytes32 => mapping(address => bool)) public batchNonResponders;
+    mapping(uint64 => bytes32) public pendingAssets;
+    mapping(uint64 => bool) public settledAssets;
+    mapping(address => uint256) public nonVerifierRewards;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SELECTION BUCKET SNAPSHOTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Total selection stake in each bucket (SNAPSHOT)
+    uint256[14] public bucketStakeSumSel;
+
+    /// @notice Count of verifiers in each bucket (SNAPSHOT)
+    uint256[14] public bucketCountSel;
+
+    /// @notice Total selection stake (SNAPSHOT)
+    uint256 public totalSelectionStake;
+
+    /// @notice Total verifier count with selection stake (SNAPSHOT)
+    uint256 public totalSelectionCount;
+
+    /// @notice Suffix sum of selection stake from bucket i onwards
+    uint256[14] public eligibleStakeFromBucket;
+
+    /// @notice Suffix sum of verifier count from bucket i onwards
+    uint256[14] public eligibleCountFromBucket;
+
+    // NEXT arrays for double-buffer finalization
+    uint256[14] internal bucketStakeSumNext;
+    uint256[14] internal bucketCountNext;
+    uint256 internal totalSelectionStakeNext;
+    uint256 internal totalSelectionCountNext;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EPOCH MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    uint256 public activeEpoch;
+    uint256 public pendingEpoch;
+    mapping(uint256 => bool) public epochFinalized;
+    mapping(uint256 => uint256) public epochFinalizedUpTo;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PER-BATCH PARTICIPATION TRACKING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    mapping(bytes32 => mapping(address => uint8)) public committedRoundPlus1;
+    mapping(bytes32 => mapping(address => uint8)) public revealedRoundPlus1;
+    mapping(bytes32 => mapping(uint8 => address[])) public roundCommitters;
+    mapping(bytes32 => mapping(uint8 => mapping(uint64 => mapping(Decision => uint16)))) public assetVoteCountsR;
+    mapping(bytes32 => mapping(uint8 => mapping(uint64 => mapping(RefundReason => uint16)))) public assetRefundReasonCountsR;
+
+    // Batch collision prevention
+    uint256 public batchNonce;
+
+    // Finalizer rewards (pull pattern)
+    mapping(address => uint256) public finalizerRewards;
+    uint256 public lastEpochStartTime;
+
+    // Rebuild-safe slashing
+    mapping(address => uint256) internal selectionEpochTag;
+    mapping(bytes32 => mapping(uint8 => uint40)) public roundRevealDeadline;
+
+    // Epoch ID reuse prevention + deferred suspension
+    uint256 public epochNonce;
+    mapping(address => bool) public needsSuspension;
+    mapping(uint256 => uint40) public epochFulfilledAt;
+    uint256 public auditBatchNonce;
+
+    // Epoch-starter bond
+    address public epochStarter;
+    mapping(uint256 => uint256) public epochStarterBonds;
+
+    // slashNoReveal tracking
+    mapping(bytes32 => mapping(address => bool)) public slashedForNoReveal;
+
+    // Pending registration stake for concentration check
+    uint256 public pendingRegistrationStake;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event VerifierRegistered(address indexed verifier, uint256 stake);
+    event VerifierStakeUpdated(address indexed verifier, uint256 newStake);
+    event VerifierSlashed(address indexed verifier, uint256 amount, string reason);
+    event VerifierSuspended(address indexed verifier, string reason);
+    event UnbondingInitiated(address indexed verifier, uint256 amount, uint40 cooldownEnds);
+    event UnbondingClaimed(address indexed verifier, uint256 amount);
+    event UnbondingCancelled(address indexed verifier, uint256 amount);
+    event BatchCreated(bytes32 indexed batchId, uint64[] assetIds, uint256 totalValue);
+    event CommitSubmitted(bytes32 indexed batchId, address indexed verifier);
+    event RevealSubmitted(bytes32 indexed batchId, address indexed verifier, uint256 assetCount);
+    event AssetVoteRecorded(bytes32 indexed batchId, uint64 indexed assetId, address indexed verifier, Decision decision);
+    event AssetConsensusReached(bytes32 indexed batchId, uint64 indexed assetId, Decision decision, RefundReason reason);
+    event BatchExecuted(bytes32 indexed batchId, uint256 claimCount, uint256 refundCount, address indexed creator);
+    event EpochStarted(uint256 indexed epoch, uint256 vrfRequestId);
+    event EpochFulfilled(uint256 indexed epoch, address[] selectedVerifiers);
+    event EpochCompleted(uint256 indexed epochId);
+    event EpochFinalizationProgress(uint256 indexed epochId, uint256 processed, uint256 total);
+    event RewardsDistributed(bytes32 indexed batchId, uint256 totalFees);
+    event RewardClaimed(address indexed verifier, uint256 amount);
+    event BatchDepositUpdated(uint256 newDeposit);
+    event AuditChallenged(bytes32 indexed batchId, address indexed challenger, uint256 bond, Decision claimedTruth);
+    event AuditResolved(bytes32 indexed originalBatchId, bytes32 indexed auditBatchId, bool originalWasWrong, uint256 wrongAssetCount);
+    event TreasuryWithdraw(address indexed to, uint256 amount);
+    event VRFConfigUpdated(uint256 subscriptionId, bytes32 keyHash);
+    event BatchRetried(bytes32 indexed batchId, uint8 retryCount, address[] newVerifiers);
+    event BatchFailed(bytes32 indexed batchId, string reason);
+    event NonRevealMinorityPenalty(address indexed verifier, bytes32 indexed batchId, uint256 assetCount);
+    event ArweaveBatchCreated(bytes32 indexed batchId, uint64[] assetIds, uint64 arweaveBlock, uint256 totalValue, address indexed creator);
+    event BatchSettled(bytes32 indexed batchId, Decision decision, uint64[] assetIds);
+    event FinalizationRewardPaid(address indexed finalizer, uint256 amount);
+    event FinalizerRewardsClaimed(address indexed finalizer, uint256 amount);
+    event SuspensionDeferred(address indexed verifier, string reason);
+    event DeferredSuspensionProcessed(address indexed verifier);
+    event EpochCancelled(uint256 indexed epochId, string reason);
+    event EpochStarterBondReturned(address indexed starter, uint256 indexed epochId, uint256 amount);
+    event EpochStarterBondSlashed(address indexed starter, uint256 indexed epochId, uint256 amount);
+    event StaleEpochBatchFailed(bytes32 indexed batchId, uint256 batchEpoch, uint256 activeEpoch);
+    event ConcentrationCapApplied(address indexed verifier, uint256 originalStake, uint256 cappedStake);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ERRORS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    error InsufficientStake(uint256 provided, uint256 required);
+    error StakeExceedsMax(uint256 requested, uint256 maxAllowed);
+    error NotActiveVerifier();
+    error AlreadyRegistered();
+    error NotEnoughVerifiers(uint256 current, uint256 required);
+    error BatchNotFound();
+    error InvalidBatchState(BatchState current, BatchState expected);
+    error NotSelectedVerifier();
+    error AlreadyCommitted();
+    error AlreadyRevealed();
+    error CommitHashMismatch();
+    error ThresholdNotMet(uint256 votes, uint256 required);
+    error BatchCapExceeded(uint256 value, uint256 cap);
+    error InvalidInput();
+    error UnbondingInProgress();
+    error VRFNotReady();
+    error DecisionCountMismatch(uint256 provided, uint256 expected);
+    error InvalidAssetId(uint64 assetId);
+    error BatchNotReady();
+    error ProofAlreadyProcessed(bytes32 arweaveTxId);
+    error AssetAlreadySettled(uint64 assetId);
+    error AssetInPendingBatch(uint64 assetId, bytes32 existingBatchId);
+    error AssetNotPending(uint64 assetId);
+    error AssetNotReady(uint64 assetId, uint256 readyAt);
+    error LengthMismatch();
+    error EmptyBatch();
+    error BatchTooLarge(uint256 provided, uint256 max);
+    error EpochTransitioning();
+    error StakeFrozen();
+    error EpochNotStale();
+    error EpochTooSoon();
+    error NoRewardsToClaim();
+    error StaleEpochBatch(bytes32 batchId, uint256 batchEpoch, uint256 currentEpoch);
+    error RebuildInProgress();
+    error MinStakeOutOfRange(uint256 minStake, uint256 maxSupported);
+    error InsufficientEligibleVerifiers(uint256 available, uint256 required);
+    error BatchValueExceedsMax(uint256 value, uint256 max);
+    error OnlyEpochStarterCanBegin();
+    error NoActiveEpoch();
+    error AuditBatchMustUseExecuteAudit();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTRUCTOR
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    constructor(
+        address _usdc,
+        address _jjskin,
+        address _vrfCoordinator,
+        address _extensionDelegate
+    ) VRFConsumerBaseV2Plus(_vrfCoordinator) {
+        if (_usdc == address(0) || _jjskin == address(0) || _extensionDelegate == address(0)) revert ZeroAddress();
+        usdc = IERC20(_usdc);
+        jjskin = _jjskin;
+        extensionDelegate = _extensionDelegate;
+    }
+
+    /// @notice Fallback delegates to extension contract
+    fallback() external {
+        address delegate = extensionDelegate;
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), delegate, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BUCKET MANAGEMENT (V2)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Calculate bucket index for a stake amount
+    function _getBucket(uint256 stake) internal pure returns (uint8) {
+        if (stake < BUCKET_BASE) return 0;
+        uint256 normalized = stake / BUCKET_BASE;
+        uint8 bucket = 0;
+        if (normalized >= 1 << 8) { normalized >>= 8; bucket += 8; }
+        if (normalized >= 1 << 4) { normalized >>= 4; bucket += 4; }
+        if (normalized >= 1 << 2) { normalized >>= 2; bucket += 2; }
+        if (normalized >= 1 << 1) { bucket += 1; }
+        if (bucket >= MAX_BUCKETS) bucket = uint8(MAX_BUCKETS - 1);
+        return bucket;
+    }
+
+    function _getBucketLowerBound(uint8 bucket) internal pure returns (uint256) {
+        return BUCKET_BASE << bucket;
+    }
+
+    function _getEligibleStake(uint256 minStake) internal view returns (uint256) {
+        uint8 minBucket = _getMinBucket(minStake);
+        if (minBucket >= MAX_BUCKETS) return 0;
+        return eligibleStakeFromBucket[minBucket];
+    }
+
+    function _getEligibleCount(uint256 minStake) internal view returns (uint256) {
+        uint8 minBucket = _getMinBucket(minStake);
+        if (minBucket >= MAX_BUCKETS) return 0;
+        return eligibleCountFromBucket[minBucket];
+    }
+
+    function _getMinBucket(uint256 minStake) internal pure returns (uint8) {
+        if (minStake == 0) return 0;
+        uint8 bucket = _getBucket(minStake);
+        uint256 lowerBound = _getBucketLowerBound(bucket);
+        if (minStake > lowerBound && bucket < MAX_BUCKETS - 1) {
+            bucket++;
+        }
+        if (bucket >= MAX_BUCKETS) {
+            revert MinStakeOutOfRange(minStake, _getBucketLowerBound(uint8(MAX_BUCKETS - 1)));
+        }
+        return bucket;
+    }
+
+    function _getMinStake(uint256 batchValue) internal pure returns (uint256) {
+        return (batchValue * SECURITY_MARGIN_BPS) / (QUORUM * BPS);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BUCKET-AWARE CONCENTRATION CHECK (WITH PENDING STAKE)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Check concentration cap for a verifier's new stake
+    /// @dev Include pendingRegistrationStake to prevent race condition
+    ///      Multiple registrations in same epoch can't bypass concentration limit
+    function _checkConcentration(address, uint256 newStake) internal view {
+        if (activeVerifierCount < CONCENTRATION_ENFORCEMENT_MIN) return;
+
+        uint8 k = _getBucket(newStake);
+        // Add pending registrations to eligible pool for accurate cap calculation
+        uint256 eligible = eligibleStakeFromBucket[k] + pendingRegistrationStake;
+        if (eligible == 0) return;
+
+        uint256 maxAllowed = eligible / (TAU_MAX * CONCENTRATION_FACTOR);
+        if (newStake > maxAllowed) revert StakeExceedsMax(newStake, maxAllowed);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EPOCH STATE HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _isStakeFrozen() internal view returns (bool) {
+        if (pendingEpoch == 0) return false;
+        return epochs[pendingEpoch].fulfilled;
+    }
+
+    function _isSnapshotRebuilding() internal view returns (bool) {
+        if (pendingEpoch == 0) return false;
+        return epochFinalizedUpTo[pendingEpoch] > 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STAKING (REGISTRATION)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function registerVerifier(uint256 amount) external nonReentrant {
+        if (_isStakeFrozen()) revert StakeFrozen();
+        if (_verifiers[msg.sender].isActive) revert AlreadyRegistered();
+        if (amount < MIN_STAKE) revert InsufficientStake(amount, MIN_STAKE);
+
+        _checkConcentration(msg.sender, amount);
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        _verifiers[msg.sender] = Verifier({
+            stakedAmount: amount,
+            selectionStake: 0,
+            unbondingAmount: 0,
+            pendingRewards: 0,
+            minorityVotes: 0,
+            totalVotes: 0,
+            assignedBatches: 0,
+            registeredAt: uint40(block.timestamp),
+            lastSlashTime: 0,
+            unbondingStart: 0,
+            minorityWarnings: 0,
+            participationWarnings: 0,
+            isActive: true
+        });
+
+        verifierIndex[msg.sender] = activeVerifierList.length;
+        activeVerifierList.push(msg.sender);
+        activeVerifierCount++;
+        totalStake += amount;
+
+        // Track pending stake for concentration check
+        pendingRegistrationStake += amount;
+
+        emit VerifierRegistered(msg.sender, amount);
+    }
+
+    function addStake(uint256 amount) external nonReentrant {
+        if (_isStakeFrozen()) revert StakeFrozen();
+        Verifier storage v = _verifiers[msg.sender];
+        if (!v.isActive) revert NotActiveVerifier();
+
+        uint256 newStake = v.stakedAmount + amount;
+        _checkConcentration(msg.sender, newStake);
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        v.stakedAmount = newStake;
+        totalStake += amount;
+
+        // Track pending stake for concentration check (same as registerVerifier)
+        pendingRegistrationStake += amount;
+
+        emit VerifierStakeUpdated(msg.sender, newStake);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BATCH CREATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMMIT-REVEAL VOTING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function submitCommit(bytes32 batchId, bytes32 commitHash) external {
+        if (_isSnapshotRebuilding()) revert EpochTransitioning();
+
+        Batch storage batch = _batches[batchId];
+        if (batch.createdAt == 0) revert BatchNotFound();
+
+        // Check for stale epoch batch
+        if (batch.batchEpoch != activeEpoch) {
+            revert StaleEpochBatch(batchId, batch.batchEpoch, activeEpoch);
+        }
+
+        BatchState state = _poke(batchId);
+        if (state != BatchState.COMMIT_PHASE) {
+            revert InvalidBatchState(state, BatchState.COMMIT_PHASE);
+        }
+
+        uint8 round = batch.currentRound;
+
+        // One participation per batch
+        if (committedRoundPlus1[batchId][msg.sender] != 0) {
+            revert AlreadyCommitted();
+        }
+
+        // Self-selection check
+        if (!_isSelected(batchId, round, msg.sender)) {
+            revert NotSelectedVerifier();
+        }
+
+        commits[batchId][msg.sender] = commitHash;
+        committedRoundPlus1[batchId][msg.sender] = round + 1;
+        roundCommitters[batchId][round].push(msg.sender);
+
+        // Store per-round reveal deadline
+        roundRevealDeadline[batchId][round] = batch.revealDeadline;
+
+        emit CommitSubmitted(batchId, msg.sender);
+    }
+
+    function submitReveal(
+        bytes32 batchId,
+        AssetDecision[] calldata decisions,
+        bytes32 salt
+    ) external nonReentrant {
+        BatchState state = _poke(batchId);
+
+        Batch storage batch = _batches[batchId];
+        if (state != BatchState.REVEAL_PHASE) {
+            revert InvalidBatchState(state, BatchState.REVEAL_PHASE);
+        }
+
+        uint8 round = batch.currentRound;
+
+        // Must have committed THIS round
+        uint8 commitRound = committedRoundPlus1[batchId][msg.sender];
+        if (commitRound != round + 1) {
+            revert CommitHashMismatch();
+        }
+
+        // Cannot reveal twice
+        if (revealedRoundPlus1[batchId][msg.sender] != 0) {
+            revert AlreadyRevealed();
+        }
+
+        if (decisions.length != batch.assetIds.length) {
+            revert DecisionCountMismatch(decisions.length, batch.assetIds.length);
+        }
+
+        // Verify commitment
+        bytes32 expectedHash = keccak256(abi.encode(batchId, round, decisions, salt));
+        if (commits[batchId][msg.sender] != expectedHash) {
+            revert CommitHashMismatch();
+        }
+
+        Verifier storage v = _verifiers[msg.sender];
+
+        // Record reveal
+        revealedRoundPlus1[batchId][msg.sender] = round + 1;
+        hasRevealed[batchId][msg.sender] = true;
+        batchVoters[batchId].push(msg.sender);
+        batch.revealCount++;
+        v.assignedBatches++;
+        v.totalVotes += decisions.length;
+
+        // Record per-asset, per-round votes
+        for (uint256 i = 0; i < decisions.length; i++) {
+            AssetDecision calldata d = decisions[i];
+
+            if (d.assetId != batch.assetIds[i]) {
+                revert InvalidAssetId(d.assetId);
+            }
+
+            assetVotes[batchId][d.assetId][msg.sender] = d;
+            assetVoteCountsR[batchId][round][d.assetId][d.decision]++;
+            assetVoteCounts[batchId][d.assetId][d.decision]++;
+
+            if (d.decision == Decision.REFUND) {
+                assetRefundReasonCountsR[batchId][round][d.assetId][d.refundReason]++;
+                assetRefundReasonCounts[batchId][d.assetId][d.refundReason]++;
+            }
+
+            emit AssetVoteRecorded(batchId, d.assetId, msg.sender, d.decision);
+        }
+
+        emit RevealSubmitted(batchId, msg.sender, decisions.length);
+
+        _tryAutoExecuteRound(batchId, round);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SELECTION (Stake-weighted self-selection)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _isSelected(bytes32 batchId, uint8 round, address verifier) internal view returns (bool) {
+        Batch storage batch = _batches[batchId];
+        Verifier storage v = _verifiers[verifier];
+
+        if (!v.isActive) return false;
+
+        uint256 stake = v.selectionStake;
+        if (stake == 0) return false;
+
+        // Get effective min stake (bucket-snapped)
+        uint256 minStakeRaw = _getMinStake(batch.totalValue);
+        uint8 minBucket = _getMinBucket(minStakeRaw);
+        uint256 minStakeEff = _getBucketLowerBound(minBucket);
+
+        if (stake < minStakeEff) return false;
+
+        // Get eligible stake for this batch
+        uint256 eligibleStake = eligibleStakeFromBucket[minBucket];
+        if (eligibleStake == 0) return false;
+
+        // Dynamic τ for retries
+        uint256 tau = EXPECTED_COMMITTEE_SIZE + (uint256(round) * TAU_ROUND_INCREMENT);
+
+        // Compute selection threshold
+        uint256 numerator = stake * tau;
+
+        // Overflow check
+        if (numerator / stake != tau) {
+            return true; // Overflow means very high probability, treat as selected
+        }
+
+        if (numerator >= eligibleStake) return true; // 100% selected
+
+        // Compute per-round seed
+        Epoch storage epoch = epochs[batch.batchEpoch];
+        bytes32 roundSeed = keccak256(abi.encode(epoch.randomSeed, batchId, round, batch.createdEntropy));
+        uint256 roll = uint256(keccak256(abi.encode(roundSeed, verifier)));
+
+        // Use Math.mulDiv for overflow-safe threshold calculation
+        uint256 threshold = Math.mulDiv(numerator, type(uint256).max, eligibleStake);
+
+        return roll < threshold;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VRF & EPOCH MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function startNewEpoch() external nonReentrant returns (uint256 requestId) {
+        if (pendingEpoch != 0) revert InvalidInput();
+        if (block.timestamp < lastEpochStartTime + EPOCH_MIN_INTERVAL) revert EpochTooSoon();
+        if (activeVerifierCount < MIN_ORACLE_COUNT) {
+            revert NotEnoughVerifiers(activeVerifierCount, MIN_ORACLE_COUNT);
+        }
+        // Pre-flight VRF config check to prevent wasted bond
+        if (s_subscriptionId == 0 || s_keyHash == bytes32(0)) revert VRFNotReady();
+
+        // Require bond
+        usdc.safeTransferFrom(msg.sender, address(this), EPOCH_STARTER_BOND);
+
+        uint256 epochId = ++epochNonce;
+
+        requestId = s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: s_keyHash,
+                subId: s_subscriptionId,
+                requestConfirmations: s_requestConfirmations,
+                callbackGasLimit: s_callbackGasLimit,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+            })
+        );
+
+        epochs[epochId] = Epoch({
+            vrfRequestId: requestId,
+            randomSeed: 0,
+            startTime: uint40(block.timestamp),
+            fulfilled: false
+        });
+
+        vrfRequestToEpoch[requestId] = epochId;
+        pendingEpoch = epochId;
+        lastEpochStartTime = block.timestamp;
+        epochStarter = msg.sender;
+        epochStarterBonds[epochId] = EPOCH_STARTER_BOND;
+
+        emit EpochStarted(epochId, requestId);
+    }
+
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
+        uint256 epochId = vrfRequestToEpoch[requestId];
+        if (epochId == 0) return;
+
+        Epoch storage epoch = epochs[epochId];
+        if (epoch.vrfRequestId != requestId) return;
+        if (epoch.fulfilled) return;
+
+        epoch.randomSeed = randomWords[0];
+        epoch.fulfilled = true;
+        epochFulfilledAt[epochId] = uint40(block.timestamp);
+
+        emit EpochFulfilled(epochId, new address[](0));
+    }
+
+    function finalizeEpochChunk(uint256 epochId, uint256 count) external nonReentrant {
+        if (count == 0) revert InvalidInput();
+        if (epochId != pendingEpoch) revert InvalidInput();
+
+        Epoch storage epoch = epochs[epochId];
+        if (!epoch.fulfilled) revert VRFNotReady();
+        if (epochFinalized[epochId]) revert InvalidInput();
+
+        uint256 start = epochFinalizedUpTo[epochId];
+
+        // Only epochStarter can start first chunk
+        if (start == 0) {
+            if (msg.sender != epochStarter) revert OnlyEpochStarterCanBegin();
+            for (uint8 i = 0; i < MAX_BUCKETS; i++) {
+                bucketStakeSumNext[i] = 0;
+                bucketCountNext[i] = 0;
+            }
+            totalSelectionStakeNext = 0;
+            totalSelectionCountNext = 0;
+        }
+
+        uint256 end = start + count;
+        if (end > activeVerifierList.length) {
+            end = activeVerifierList.length;
+        }
+
+        // Memory accumulators for gas optimization
+        uint256[14] memory localBucketSum;
+        uint256[14] memory localBucketCount;
+        uint256 localTotalStake = 0;
+        uint256 localTotalCount = 0;
+
+        for (uint256 i = start; i < end; ) {
+            address v = activeVerifierList[i];
+            Verifier storage verifier = _verifiers[v];
+            uint256 stake = verifier.stakedAmount;
+
+            verifier.selectionStake = stake;
+            selectionEpochTag[v] = epochId;
+
+            if (stake >= BUCKET_BASE) {
+                uint8 bucket = _getBucket(stake);
+                localBucketSum[bucket] += stake;
+                localBucketCount[bucket]++;
+            }
+            localTotalStake += stake;
+            localTotalCount++;
+
+            unchecked { ++i; }
+        }
+
+        // Batch write to storage
+        for (uint8 b = 0; b < MAX_BUCKETS; ) {
+            if (localBucketSum[b] > 0) {
+                bucketStakeSumNext[b] += localBucketSum[b];
+                bucketCountNext[b] += localBucketCount[b];
+            }
+            unchecked { ++b; }
+        }
+        totalSelectionStakeNext += localTotalStake;
+        totalSelectionCountNext += localTotalCount;
+
+        epochFinalizedUpTo[epochId] = end;
+
+        if (end >= activeVerifierList.length) {
+            _completeEpochFinalization(epochId);
+        }
+
+        // Proportional reward
+        uint256 processed = end - start;
+        if (processed > 0) {
+            uint256 proratedReward = (FINALIZE_CHUNK_REWARD * processed) / EPOCH_FINALIZE_CHUNK_SIZE;
+            if (proratedReward > 0 && slashingTreasury >= proratedReward) {
+                slashingTreasury -= proratedReward;
+                finalizerRewards[msg.sender] += proratedReward;
+                emit FinalizationRewardPaid(msg.sender, proratedReward);
+            }
+        }
+
+        emit EpochFinalizationProgress(epochId, end, activeVerifierList.length);
+    }
+
+    function _completeEpochFinalization(uint256 epochId) internal {
+        // SWAP: Next → Active
+        for (uint8 i = 0; i < MAX_BUCKETS; ) {
+            bucketStakeSumSel[i] = bucketStakeSumNext[i];
+            bucketCountSel[i] = bucketCountNext[i];
+            unchecked { ++i; }
+        }
+        totalSelectionStake = totalSelectionStakeNext;
+        totalSelectionCount = totalSelectionCountNext;
+
+        _recomputeSuffixCaches();
+
+        // Continuous concentration enforcement
+        _checkContinuousConcentration();
+
+        // Reset pending stake (now incorporated into selection snapshot)
+        pendingRegistrationStake = 0;
+
+        epochFinalized[epochId] = true;
+        activeEpoch = epochId;
+        pendingEpoch = 0;
+
+        // Return bond to starter
+        uint256 bond = epochStarterBonds[epochId];
+        address starter = epochStarter;
+        if (bond > 0 && starter != address(0)) {
+            epochStarterBonds[epochId] = 0;
+            epochStarter = address(0);
+            usdc.safeTransfer(starter, bond);
+            emit EpochStarterBondReturned(starter, epochId, bond);
+        }
+
+        emit EpochCompleted(epochId);
+    }
+
+    /// @notice Check concentration cap at epoch finalization
+    /// @dev Update bucket arrays when capping stake to maintain consistency
+    function _checkContinuousConcentration() internal {
+        if (activeVerifierCount < CONCENTRATION_ENFORCEMENT_MIN) return;
+
+        bool anyChange = false;
+        for (uint256 i = 0; i < activeVerifierList.length; ) {
+            address v = activeVerifierList[i];
+            uint256 oldStake = _verifiers[v].selectionStake;
+
+            if (oldStake > 0) {
+                uint8 k = _getBucket(oldStake);
+                uint256 eligible = eligibleStakeFromBucket[k];
+
+                if (eligible > 0) {
+                    uint256 maxAllowed = eligible / (TAU_MAX * CONCENTRATION_FACTOR);
+
+                    if (oldStake > maxAllowed) {
+                        // Update bucket arrays before changing stake
+                        uint8 oldBucket = k;
+                        uint8 newBucket = _getBucket(maxAllowed);
+
+                        // Remove from old bucket
+                        bucketStakeSumSel[oldBucket] -= oldStake;
+                        bucketCountSel[oldBucket]--;
+
+                        // Add to new bucket
+                        bucketStakeSumSel[newBucket] += maxAllowed;
+                        bucketCountSel[newBucket]++;
+
+                        // Update totals
+                        totalSelectionStake -= (oldStake - maxAllowed);
+
+                        _verifiers[v].selectionStake = maxAllowed;
+                        anyChange = true;
+                        emit ConcentrationCapApplied(v, oldStake, maxAllowed);
+                    }
+                }
+            }
+
+            unchecked { ++i; }
+        }
+
+        // Recompute suffix caches if any stake was capped
+        if (anyChange) {
+            _recomputeSuffixCaches();
+        }
+    }
+
+    function _recomputeSuffixCaches() internal {
+        uint256 runningStake = 0;
+        uint256 runningCount = 0;
+
+        for (uint8 i = uint8(MAX_BUCKETS); i > 0; ) {
+            unchecked { --i; }
+            runningStake += bucketStakeSumSel[i];
+            runningCount += bucketCountSel[i];
+            eligibleStakeFromBucket[i] = runningStake;
+            eligibleCountFromBucket[i] = runningCount;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SLASHING & SUSPENSION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _slashVerifier(address verifierAddr, uint256 amount, string memory reason) internal {
+        Verifier storage v = _verifiers[verifierAddr];
+
+        uint256 slashable = v.stakedAmount;
+        uint256 actualSlash = amount > slashable ? slashable : amount;
+
+        if (actualSlash == 0) return;
+
+        uint256 oldSelectionStake = v.selectionStake;
+
+        v.stakedAmount -= actualSlash;
+        totalStake -= actualSlash;
+
+        if (v.unbondingAmount > 0) {
+            uint256 unbondingSlash = (actualSlash * v.unbondingAmount) / slashable;
+            v.unbondingAmount -= unbondingSlash;
+        }
+
+        // Handle slashing during rebuild
+        if (_isSnapshotRebuilding()) {
+            if (selectionEpochTag[verifierAddr] == pendingEpoch) {
+                uint256 newSelectionStake = v.stakedAmount;
+                _applyNextSnapshotDelta(verifierAddr, oldSelectionStake, newSelectionStake);
+                v.selectionStake = newSelectionStake;
+            }
+        } else {
+            _updateSelectionStake(verifierAddr, v.stakedAmount);
+        }
+
+        slashingTreasury += actualSlash;
+        v.lastSlashTime = uint40(block.timestamp);
+
+        // Set needsSuspension flag for deferred suspension during rebuild
+        if (v.stakedAmount < MIN_STAKE && v.isActive) {
+            if (_isSnapshotRebuilding()) {
+                needsSuspension[verifierAddr] = true;
+                emit SuspensionDeferred(verifierAddr, "Low stake");
+            } else {
+                _suspendVerifier(verifierAddr, reason);
+            }
+        }
+
+        emit VerifierSlashed(verifierAddr, actualSlash, reason);
+    }
+
+    function _suspendVerifier(address verifierAddr, string memory reason) internal {
+        if (_isSnapshotRebuilding()) {
+            needsSuspension[verifierAddr] = true;
+            emit SuspensionDeferred(verifierAddr, reason);
+            return;
+        }
+
+        Verifier storage v = _verifiers[verifierAddr];
+        if (!v.isActive) return;
+
+        v.isActive = false;
+        activeVerifierCount--;
+        _removeFromActiveList(verifierAddr);
+        _removeFromSelectionSnapshot(verifierAddr);
+
+        emit VerifierSuspended(verifierAddr, reason);
+    }
+
+    function _removeFromActiveList(address verifierAddr) internal {
+        uint256 index = verifierIndex[verifierAddr];
+        uint256 lastIndex = activeVerifierList.length - 1;
+
+        if (index != lastIndex) {
+            address lastVerifier = activeVerifierList[lastIndex];
+            activeVerifierList[index] = lastVerifier;
+            verifierIndex[lastVerifier] = index;
+        }
+
+        activeVerifierList.pop();
+        delete verifierIndex[verifierAddr];
+    }
+
+    function _updateSelectionStake(address verifierAddr, uint256 newStake) internal {
+        Verifier storage v = _verifiers[verifierAddr];
+        uint256 oldStake = v.selectionStake;
+
+        if (oldStake == newStake) return;
+
+        // Remove old stake from buckets
+        if (oldStake >= BUCKET_BASE) {
+            uint8 oldBucket = _getBucket(oldStake);
+            bucketStakeSumSel[oldBucket] -= oldStake;
+            bucketCountSel[oldBucket]--;
+        }
+        totalSelectionStake -= oldStake;
+
+        // Add new stake to buckets
+        if (newStake >= BUCKET_BASE) {
+            uint8 newBucket = _getBucket(newStake);
+            bucketStakeSumSel[newBucket] += newStake;
+            bucketCountSel[newBucket]++;
+        }
+        totalSelectionStake += newStake;
+
+        v.selectionStake = newStake;
+
+        _recomputeSuffixCaches();
+    }
+
+    function _removeFromSelectionSnapshot(address verifierAddr) internal {
+        Verifier storage v = _verifiers[verifierAddr];
+        uint256 stake = v.selectionStake;
+
+        if (stake == 0) return;
+
+        if (stake >= BUCKET_BASE) {
+            uint8 bucket = _getBucket(stake);
+            bucketStakeSumSel[bucket] -= stake;
+            bucketCountSel[bucket]--;
+        }
+        totalSelectionStake -= stake;
+        totalSelectionCount--;
+
+        v.selectionStake = 0;
+
+        _recomputeSuffixCaches();
+    }
+
+    function _applyNextSnapshotDelta(address, uint256 oldStake, uint256 newStake) internal {
+        // Remove old stake from Next arrays
+        if (oldStake >= BUCKET_BASE) {
+            uint8 oldBucket = _getBucket(oldStake);
+            bucketStakeSumNext[oldBucket] -= oldStake;
+            bucketCountNext[oldBucket]--;
+        }
+        if (oldStake > 0) {
+            totalSelectionStakeNext -= oldStake;
+            totalSelectionCountNext--;
+        }
+
+        // Add new stake to Next arrays
+        if (newStake >= BUCKET_BASE) {
+            uint8 newBucket = _getBucket(newStake);
+            bucketStakeSumNext[newBucket] += newStake;
+            bucketCountNext[newBucket]++;
+        }
+        if (newStake > 0) {
+            totalSelectionStakeNext += newStake;
+            totalSelectionCountNext++;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SLASH NON-PARTICIPATION - Storage only, functions in Extension
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev Tracks which verifiers have been slashed for not committing to a batch/round
+    /// @dev slashNoCommit() and slashNoReveal() are in VerifierNetworkExt, called via fallback
+    mapping(bytes32 => mapping(uint8 => mapping(address => bool))) public slashedForNoCommit;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BATCH STATE MACHINE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _poke(bytes32 batchId) internal returns (BatchState) {
+        Batch storage batch = _batches[batchId];
+        if (batch.createdAt == 0) revert BatchNotFound();
+
+        if (batch.state == BatchState.EXECUTED) return BatchState.EXECUTED;
+
+        // Check commit phase timeout
+        if (batch.state == BatchState.COMMIT_PHASE && block.timestamp > batch.commitDeadline) {
+            uint256 commitCount = roundCommitters[batchId][batch.currentRound].length;
+            if (commitCount == 0) {
+                // No commits = retry or fail (don't set READY with no votes!)
+                _openNextRoundOrFail(batchId);
+                return batch.state;
+            }
+            batch.state = BatchState.REVEAL_PHASE;
+        }
+
+        // Check reveal phase timeout
+        if (batch.state == BatchState.REVEAL_PHASE && block.timestamp > batch.revealDeadline) {
+            if (batch.revealCount == 0) {
+                // No reveals = retry or fail (commits without reveals)
+                _openNextRoundOrFail(batchId);
+            } else {
+                // Try to execute or retry
+                if (!_tryAutoExecuteRound(batchId, batch.currentRound)) {
+                    _openNextRoundOrFail(batchId);
+                }
+            }
+        }
+
+        return batch.state;
+    }
+
+    function _tryAutoExecuteRound(bytes32 batchId, uint8 round) internal returns (bool) {
+        Batch storage batch = _batches[batchId];
+
+        // Check if all assets have consensus for this round
+        bool allConsensus = true;
+        for (uint256 i = 0; i < batch.assetIds.length; i++) {
+            uint64 assetId = batch.assetIds[i];
+
+            // Check each decision type
+            uint16 claimVotes = assetVoteCountsR[batchId][round][assetId][Decision.CLAIM];
+            uint16 refundVotes = assetVoteCountsR[batchId][round][assetId][Decision.REFUND];
+            uint16 invalidVotes = assetVoteCountsR[batchId][round][assetId][Decision.INVALID];
+
+            if (claimVotes >= QUORUM) {
+                assetConsensus[batchId][assetId] = AssetConsensus({
+                    decision: Decision.CLAIM,
+                    refundReason: RefundReason.None,
+                    votesFor: uint8(claimVotes),
+                    hasConsensus: true
+                });
+            } else if (refundVotes >= QUORUM) {
+                RefundReason reason = _getMajorityRefundReason(batchId, round, assetId);
+                assetConsensus[batchId][assetId] = AssetConsensus({
+                    decision: Decision.REFUND,
+                    refundReason: reason,
+                    votesFor: uint8(refundVotes),
+                    hasConsensus: true
+                });
+            } else if (invalidVotes >= QUORUM) {
+                assetConsensus[batchId][assetId] = AssetConsensus({
+                    decision: Decision.INVALID,
+                    refundReason: RefundReason.None,
+                    votesFor: uint8(invalidVotes),
+                    hasConsensus: true
+                });
+            } else {
+                allConsensus = false;
+            }
+        }
+
+        if (allConsensus) {
+            batch.state = BatchState.READY;
+            return true;
+        }
+
+        return false;
+    }
+
+    function _getMajorityRefundReason(bytes32 batchId, uint8 round, uint64 assetId) internal view returns (RefundReason) {
+        RefundReason bestReason = RefundReason.None;
+        uint16 bestCount = 0;
+
+        for (uint8 r = 1; r <= 4; r++) {
+            RefundReason reason = RefundReason(r);
+            uint16 count = assetRefundReasonCountsR[batchId][round][assetId][reason];
+            if (count > bestCount) {
+                bestCount = count;
+                bestReason = reason;
+            }
+        }
+
+        return bestReason;
+    }
+
+    function _openNextRoundOrFail(bytes32 batchId) internal {
+        Batch storage batch = _batches[batchId];
+
+        // Epoch-bound check
+        if (batch.batchEpoch != activeEpoch) {
+            _handleBatchFailure(batchId);
+            emit StaleEpochBatchFailed(batchId, batch.batchEpoch, activeEpoch);
+            return;
+        }
+
+        if (batch.currentRound >= MAX_ROUNDS - 1) {
+            _handleBatchFailure(batchId);
+            return;
+        }
+
+        batch.currentRound++;
+        batch.revealCount = 0;
+        batch.commitDeadline = uint40(block.timestamp + COMMIT_WINDOW);
+        batch.revealDeadline = uint40(block.timestamp + COMMIT_WINDOW + REVEAL_WINDOW);
+        batch.state = BatchState.COMMIT_PHASE;
+
+        emit BatchRetried(batchId, batch.currentRound, new address[](0));
+    }
+
+    /**
+     * @notice Handle batch failure - release assets for retry (no settlement)
+     * @dev Does NOT settle on JJSKIN - assets remain Active for new batch
+     *      This prevents the attack where buyers DoS verifiers to get free refunds
+     */
+    function _handleBatchFailure(bytes32 batchId) internal {
+        Batch storage batch = _batches[batchId];
+        batch.state = BatchState.EXECUTED;
+        batch.executedAt = uint40(block.timestamp);
+
+        // Release assets for re-batching (don't settle - wait for verifiers)
+        uint64[] memory assetIds = batch.assetIds;
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            delete pendingAssets[assetIds[i]];
+        }
+
+        // Return creator deposit (they tried, failure not their fault)
+        if (batch.creatorDeposit > 0) {
+            usdc.safeTransfer(batch.creator, batch.creatorDeposit);
+        }
+
+        emit BatchFailed(batchId, "No quorum - assets released for retry");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXECUTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function executeBatch(bytes32 batchId) external nonReentrant {
+        Batch storage batch = _batches[batchId];
+        BatchState state = _poke(batchId);
+
+        if (state != BatchState.READY) revert BatchNotReady();
+
+        // Audit batches use dedicated resolution path (no JJSKIN call)
+        if (batch.isAuditBatch) {
+            address delegate = extensionDelegate;
+            bytes memory data = abi.encodeWithSignature("executeAuditBatch(bytes32)", batchId);
+            assembly {
+                let success := delegatecall(gas(), delegate, add(data, 0x20), mload(data), 0, 0)
+                if iszero(success) {
+                    returndatacopy(0, 0, returndatasize())
+                    revert(0, returndatasize())
+                }
+                return(0, 0)
+            }
+        }
+
+        batch.state = BatchState.EXECUTED;
+        batch.executedAt = uint40(block.timestamp);
+        batch.executor = msg.sender;
+
+        uint64[] memory assetIds = batch.assetIds;
+
+        // Count each type first
+        uint256 claimCount = 0;
+        uint256 refundCount = 0;
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            Decision d = assetConsensus[batchId][assetIds[i]].decision;
+            if (d == Decision.CLAIM) claimCount++;
+            else if (d == Decision.REFUND) refundCount++;
+        }
+
+        // Build arrays for JJSKIN call
+        uint64[] memory claimAssets = new uint64[](claimCount);
+        uint64[] memory refundAssets = new uint64[](refundCount);
+        IJJSKIN.RefundReason[] memory refundReasons = new IJJSKIN.RefundReason[](refundCount);
+
+        uint256 claimIdx = 0;
+        uint256 refundIdx = 0;
+
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            uint64 assetId = assetIds[i];
+            AssetConsensus storage consensus = assetConsensus[batchId][assetId];
+
+            delete pendingAssets[assetId];
+
+            if (consensus.decision == Decision.CLAIM) {
+                claimAssets[claimIdx++] = assetId;
+                settledAssets[assetId] = true;
+            } else if (consensus.decision == Decision.REFUND) {
+                refundAssets[refundIdx] = assetId;
+                // Inline mapping: FailedDelivery=1, TradeReversed=2, TradeDeclined=3, Expired=4
+                refundReasons[refundIdx] = IJJSKIN.RefundReason(uint8(consensus.refundReason));
+                refundIdx++;
+                settledAssets[assetId] = true;
+            }
+            // INVALID: asset not settled, can be re-submitted
+        }
+
+        // Execute on JJSKIN
+        if (claimCount > 0 || refundCount > 0) {
+            IJJSKIN(jjskin).batchExecuteDecisions(claimAssets, refundAssets, refundReasons);
+        }
+
+        // Distribute rewards
+        _distributeRewards(batchId);
+
+        emit BatchExecuted(batchId, claimCount, refundCount, batch.creator);
+    }
+
+    /**
+     * @notice Distribute rewards with coherent voting incentives
+     * @dev Implements Kleros-style Schelling Point mechanism:
+     *      - Only voters who voted with majority (per-asset) receive rewards
+     *      - Minority voters AND NONE voters are slashed (SLASH_MINORITY_BPS per vote)
+     *      - Slash capped at MAX_BATCH_SLASH_BPS per batch to prevent stake wipeout
+     *      - Uses selectionStake for both penalty and reward (symmetric payoff)
+     *      - Slashed stake is redistributed to majority voters
+     *
+     * Academic basis:
+     *   - Kleros Yellow Paper: "Jurors who vote incoherently lose PNK to coherent jurors"
+     *   - UMA DVM 2.0: "Slashing redistributes tokens from wrong voters to correct voters"
+     *   - Schelling Point: Voters coordinate on truth expecting others to do the same
+     *
+     * @param batchId The batch to distribute rewards for
+     */
+    function _distributeRewards(bytes32 batchId) internal {
+        Batch storage batch = _batches[batchId];
+        uint64[] memory assetIds = batch.assetIds;
+        address[] storage voters = batchVoters[batchId];
+
+        if (voters.length == 0) return;
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PHASE 1: Identify coherent (majority) vs incoherent (minority/NONE) voters
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // Track coherent vote count per voter
+        uint256[] memory coherentVotes = new uint256[](voters.length);
+        uint256[] memory incoherentVotes = new uint256[](voters.length);
+
+        for (uint256 a = 0; a < assetIds.length; a++) {
+            uint64 assetId = assetIds[a];
+            Decision majorityDecision = assetConsensus[batchId][assetId].decision;
+
+            for (uint256 v = 0; v < voters.length; v++) {
+                Decision voterDecision = assetVotes[batchId][assetId][voters[v]].decision;
+                if (voterDecision == majorityDecision && voterDecision != Decision.NONE) {
+                    // Only non-NONE majority votes count as coherent
+                    coherentVotes[v]++;
+                } else {
+                    // NONE votes AND minority votes are incoherent
+                    // This prevents risk-free abstention via NONE
+                    incoherentVotes[v]++;
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PHASE 2: Slash incoherent voters, collect slashed stake
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        uint256 totalSlashed = 0;
+        uint256 totalCoherentWeight = 0;
+
+        for (uint256 v = 0; v < voters.length; v++) {
+            address voter = voters[v];
+            Verifier storage verifier = _verifiers[voter];
+
+            // Slash for each incoherent (minority or NONE) vote
+            if (incoherentVotes[v] > 0) {
+                // Use selectionStake for symmetric payoff (not stakedAmount)
+                uint256 slashPerVote = (verifier.selectionStake * SLASH_MINORITY_BPS) / BPS;
+                uint256 totalSlash = slashPerVote * incoherentVotes[v];
+
+                // Cap at MAX_BATCH_SLASH_BPS (20%) to prevent stake wipeout
+                uint256 maxBatchSlash = (verifier.selectionStake * MAX_BATCH_SLASH_BPS) / BPS;
+                if (totalSlash > maxBatchSlash) {
+                    totalSlash = maxBatchSlash;
+                }
+
+                // Also cap at actual available stake
+                if (totalSlash > verifier.stakedAmount) {
+                    totalSlash = verifier.stakedAmount;
+                }
+
+                if (totalSlash > 0) {
+                    // Update verifier stats
+                    verifier.minorityVotes += incoherentVotes[v];
+
+                    // Perform slash (updates stake, selection snapshot, etc.)
+                    _slashVerifier(voter, totalSlash, "Minority");
+                    totalSlashed += totalSlash;
+
+                    emit NonRevealMinorityPenalty(voter, batchId, incoherentVotes[v]);
+                }
+            }
+
+            // Calculate weight for reward distribution (coherent votes × selectionStake)
+            if (coherentVotes[v] > 0) {
+                totalCoherentWeight += coherentVotes[v] * verifier.selectionStake;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PHASE 3: Distribute rewards + slashed stake to coherent voters
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        uint256 totalFees = batch.creatorDeposit;
+
+        // Pull slashed funds from treasury for redistribution to coherent voters
+        // (slashVerifier sends to treasury; we redirect to reward pool)
+        if (totalSlashed > 0 && slashingTreasury >= totalSlashed) {
+            slashingTreasury -= totalSlashed;
+        }
+
+        uint256 rewardPool = totalSlashed; // Start with slashed stake
+
+        // Add creator deposit (minus creator's share)
+        if (totalFees > 0) {
+            uint256 creatorShare = (totalFees * CREATOR_SHARE_BPS) / BPS;
+            if (creatorShare > 0) {
+                if (_verifiers[batch.creator].isActive) {
+                    _verifiers[batch.creator].pendingRewards += creatorShare;
+                } else {
+                    nonVerifierRewards[batch.creator] += creatorShare;
+                }
+            }
+
+            uint256 verifierPool = totalFees - creatorShare;
+
+            // Executor bonus
+            uint256 executorBonus = (verifierPool * EXECUTOR_BONUS_BPS) / BPS;
+            if (executorBonus > 0 && batch.executor != address(0)) {
+                if (_verifiers[batch.executor].isActive) {
+                    _verifiers[batch.executor].pendingRewards += executorBonus;
+                } else {
+                    nonVerifierRewards[batch.executor] += executorBonus;
+                }
+                verifierPool -= executorBonus;
+            }
+
+            rewardPool += verifierPool;
+        }
+
+        // Distribute to coherent voters (weighted by coherent votes × stake)
+        if (totalCoherentWeight > 0 && rewardPool > 0) {
+            uint256 distributed = 0;
+            for (uint256 v = 0; v < voters.length; v++) {
+                if (coherentVotes[v] > 0) {
+                    address voter = voters[v];
+                    Verifier storage verifier = _verifiers[voter];
+                    uint256 weight = coherentVotes[v] * verifier.selectionStake;
+                    uint256 reward = (rewardPool * weight) / totalCoherentWeight;
+
+                    if (reward > 0) {
+                        if (verifier.isActive) {
+                            verifier.pendingRewards += reward;
+                        } else {
+                            nonVerifierRewards[voter] += reward;
+                        }
+                        distributed += reward;
+                    }
+                }
+            }
+
+            // Dust to treasury
+            if (rewardPool > distributed) {
+                slashingTreasury += (rewardPool - distributed);
+            }
+        } else if (rewardPool > 0) {
+            // No coherent voters (edge case) - send to treasury
+            slashingTreasury += rewardPool;
+        }
+
+        emit RewardsDistributed(batchId, totalFees + totalSlashed);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS
+    // Note: View functions (including isVerifierSelected) are in Extension
+    //       and callable via fallback delegatecall
+}

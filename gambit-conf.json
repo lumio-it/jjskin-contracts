@@ -1,0 +1,16 @@
+{
+  "filename": "src/JJSKIN.sol",
+  "sourceroot": ".",
+  "solc": "solc",
+  "solc_remappings": [
+    "risc0/=lib/risc0-ethereum/contracts/src/",
+    "@openzeppelin/=lib/openzeppelin-contracts/"
+  ],
+  "mutations": [
+    "binary-op-mutation",
+    "require-mutation",
+    "assignment-mutation",
+    "if-statement-mutation",
+    "swap-arguments-operator-mutation"
+  ]
+}
